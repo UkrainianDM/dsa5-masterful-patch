@@ -11,5 +11,5 @@
   "scripts": ["patch.js"],
   "url": "https://github.com/UkrainianDM/dsa5-masterful-patch",
   "manifest": "https://raw.githubusercontent.com/UkrainianDM/dsa5-masterful-patch/main/module.json",
-  "download": "https://github.com/UkrainianDM/dsa5-masterful-patch/releases/download/v1.1.0/dsa5-masterful-regeneration.zip"
+  "download": "https://github.com/UkrainianDM/dsa5-masterful-patch/releases/download/v1.1.0/dsa5-masterful-patch.zip"
 }
