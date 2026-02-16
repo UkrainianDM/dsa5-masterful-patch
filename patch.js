@@ -15,9 +15,27 @@ const MASTERFUL = {
   state: new Map(),
 };
 
-function isRegenDialog(app) {
-  const tpl = app?.options?.template ?? app?._options?.template ?? "";
-  return tpl === MASTERFUL.REGEN_TEMPLATE;
+function isRegenDialog(app, root) {
+  // 1) самый надёжный индикатор в твоём случае — заголовок окна
+  const title = (app?.title ?? "").toLowerCase();
+  if (title.includes("regeneration")) return true; // "Regeneration check"
+
+  // 2) запасной вариант на случай локализации: проверяем "сигнатуры" regen-формы
+  // (в этом диалоге всегда есть селекты campsite + interruption и кнопка Roll)
+  if (!root?.querySelector) return false;
+
+  const hasCampsite =
+    !!root.querySelector('select[name="camp"]') ||
+    !!root.querySelector('select[name="campsite"]');
+
+  const hasInterruption =
+    !!root.querySelector('select[name="interruption"]');
+
+  const hasRollButton =
+    !!(root.querySelector('button[name="roll"]') ||
+       [...root.querySelectorAll("button")].some(b => (b.textContent ?? "").trim().toLowerCase() === "roll"));
+
+  return hasCampsite && hasInterruption && hasRollButton;
 }
 
 function getState(dialogId) {
@@ -183,9 +201,11 @@ function ensureRollInterception(app, root) {
 // Main hook
 Hooks.on("renderDSA5Dialog", (app, html) => {
   try {
-    if (!isRegenDialog(app)) return;
-
     const root = html?.[0] ?? html;
+    if (!root?.querySelector) return;
+
+    if (!isRegenDialog(app, root)) return;
+
     if (!root?.querySelector) return;
 
     console.log("MASTERFUL | Regen dialog render:", app.id, app.title);
