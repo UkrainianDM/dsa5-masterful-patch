@@ -216,3 +216,57 @@ Hooks.on("renderDSA5Dialog", (app, html) => {
     console.error("MASTERFUL | renderDSA5Dialog error", e);
   }
 });
+
+// ===== Intercept DSA5Dialog submit for regeneration =====
+
+Hooks.on("renderDSA5Dialog", (app, html) => {
+  const root = html?.[0] ?? html;
+  if (!root?.querySelector) return;
+  if (!isRegenDialog(app, root)) return;
+
+  // перехватываем submit только один раз на экземпляр
+  if (app._masterfulWrapped) return;
+  app._masterfulWrapped = true;
+
+  const originalSubmit = app._onSubmit?.bind(app);
+  if (!originalSubmit) {
+    console.warn("MASTERFUL | _onSubmit not found on DSA5Dialog");
+    return;
+  }
+
+  app._onSubmit = async function (event) {
+    const state = MASTERFUL.state.get(app.id) ?? { lp: true, ae: true, ke: true };
+
+    // formData — это то, что реально использует система
+    const form = this.element?.querySelector("form");
+    const formData = new FormData(form);
+
+    const data = Object.fromEntries(formData.entries());
+
+    // В regen-диалоге DSA5 использует ключи lp, ae и иногда ke
+    if (data.lp) {
+      if (state.lp) data.lp = replace1d6With4(data.lp);
+      else data.lp = "0";
+    }
+
+    if (data.ae) {
+      if (state.ae) data.ae = replace1d6With4(data.ae);
+      else data.ae = "0";
+    }
+
+    if (data.ke) {
+      if (state.ke) data.ke = replace1d6With4(data.ke);
+      else data.ke = "0";
+    }
+
+    // Вставляем модифицированные данные обратно в форму
+    for (const [key, value] of Object.entries(data)) {
+      const input = form.querySelector(`[name="${key}"]`);
+      if (input) input.value = value;
+    }
+
+    console.log("MASTERFUL | Modified regen data:", data);
+
+    return originalSubmit(event);
+  };
+});
