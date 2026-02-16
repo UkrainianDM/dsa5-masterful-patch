@@ -1,219 +1,197 @@
-/**
- * DSA5 Masterful Regeneration Toggle — v1.1.0
- * Foundry v13, DSA5 7.4.x
- *
- * - Adds toggles for LP / AE / KE to the Regeneration dialog
- * - Defaults ON
- * - Detects dialog by class (RegenerationDialog), with safe fallbacks
- * - Replaces 1d6 -> 4 only for selected resources (when per-resource formulas exist)
- */
+// patch.js — DSA5 Masterful Regeneration Toggle
+// Foundry VTT v13 + DSA5 system 7.4.x
+//
+// What it does (regen dialog only):
+// - Adds 3 toggles: LP / AE / KE (default ON)
+// - On Roll: replaces "1d6" -> "4" for enabled resources
+// - Can optionally exclude a resource by setting its formula to "0" when toggle OFF
+// - Does not modify system files
 
-const MOD = {
-  fixed: 4,
-  dieRe: /\b1d6\b/g,
-  ui: {
-    id: "dsa5-masterful-regeneration",
-    css: "dsa5-masterful-regeneration",
-    label: "Masterful Regeneration (take 4 instead of 1d6)",
-    lp: "LP",
-    ae: "AE",
-    ke: "KE"
-  }
+console.log("DSA5 Masterful Regen | patch.js loaded");
+
+const MASTERFUL = {
+  REGEN_TEMPLATE: "systems/dsa5/templates/dialog/regeneration-dialog.hbs",
+  // dialogId -> state
+  state: new Map(),
 };
 
-function hasMasterful(actor) {
-  if (!actor?.items) return false;
-  return actor.items.some(i => (i?.name ?? "").toLowerCase().includes("masterful regeneration"));
+function isRegenDialog(app) {
+  const tpl = app?.options?.template ?? app?._options?.template ?? "";
+  return tpl === MASTERFUL.REGEN_TEMPLATE;
 }
 
-/**
- * Identify the DSA5 regeneration dialog by class name primarily.
- * Fallbacks:
- * - app.object exists and has rollFormula-ish fields
- * - dialog contains Campsite/Interruption selects typical for regen
- */
-function isRegenerationDialog(app, html) {
-  const cname = app?.object?.constructor?.name ?? app?.constructor?.name ?? "";
-  if (cname === "RegenerationDialog") return true;
-
-  // Fallback 1: object has typical formula fields
-  const o = app?.object;
-  if (o && typeof o === "object") {
-    const keys = Object.keys(o);
-    const hasFormula = keys.some(k => /rollformula/i.test(k));
-    const hasDie = keys.some(k => typeof o[k] === "string" && MOD.dieRe.test(o[k]));
-    if (hasFormula && hasDie) return true;
+function getState(dialogId) {
+  if (!MASTERFUL.state.has(dialogId)) {
+    MASTERFUL.state.set(dialogId, { lp: true, ae: true, ke: true });
   }
-
-  // Fallback 2: UI has Campsite & Interruption selects typical to DSA5 regen
-  const hasCampsite = html.find('select[name="campsite"]').length > 0;
-  const hasInterruption = html.find('select[name="interruption"]').length > 0;
-  const hasBad = html.find('input[name="bad"]').length > 0;
-  return hasCampsite && hasInterruption && hasBad;
+  return MASTERFUL.state.get(dialogId);
 }
 
-/**
- * Try to find per-resource roll formula fields on the dialog object.
- * Different versions may name these differently; we support several common patterns.
- */
-function getFormulaFields(obj) {
-  if (!obj) return {};
-
-  const candidates = [
-    // likely patterns
-    { key: "rollFormulaLP", type: "lp" },
-    { key: "rollFormulaLeP", type: "lp" },
-    { key: "rollFormulaLe", type: "lp" },
-
-    { key: "rollFormulaAE", type: "ae" },
-    { key: "rollFormulaAsP", type: "ae" },
-    { key: "rollFormulaAs", type: "ae" },
-
-    { key: "rollFormulaKE", type: "ke" },
-    { key: "rollFormulaKaP", type: "ke" },
-    { key: "rollFormulaKa", type: "ke" },
-
-    // generic single formula
-    { key: "rollFormula", type: "any" }
-  ];
-
-  const found = {};
-  for (const c of candidates) {
-    if (typeof obj[c.key] === "string" && obj[c.key].match(MOD.dieRe)) {
-      found[c.type] ??= [];
-      found[c.type].push(c.key);
-    }
-  }
-  return found;
+function replace1d6With4(s) {
+  if (typeof s !== "string") return s;
+  return s.replace(/\b1d6\b/g, "4");
 }
 
-function applyMasterfulToFormulas(obj, toggles) {
-  const fields = getFormulaFields(obj);
+// Tries to find the 3 numeric/text inputs in the header row:
+// [modifier, LP, AE] as seen in your screenshot.
+// Returns { modInput, lpInput, aeInput } (some can be null).
+function findHeaderInputs(root) {
+  // Most DSA dialogs use inputs inside the form.
+  const inputs = [...root.querySelectorAll('input[type="text"], input[type="number"]')];
 
-  // If we have dedicated fields for LP/AE/KE, patch only those selected.
-  const patched = [];
+  // Heuristic: in regen dialog the first row has 3 inputs.
+  // In your UI: modifier (0) + LP (0) + AE (0)
+  const modInput = inputs[0] ?? null;
+  const lpInput = inputs[1] ?? null;
+  const aeInput = inputs[2] ?? null;
 
-  const patchKeys = (keys) => {
-    for (const k of keys) {
-      const before = obj[k];
-      const after = before.replace(MOD.dieRe, String(MOD.fixed));
-      if (after !== before) {
-        obj[k] = after;
-        patched.push(k);
-      }
-    }
-  };
-
-  const hasDedicated =
-    (fields.lp && fields.lp.length) ||
-    (fields.ae && fields.ae.length) ||
-    (fields.ke && fields.ke.length);
-
-  if (hasDedicated) {
-    if (toggles.lp && fields.lp) patchKeys(fields.lp);
-    if (toggles.ae && fields.ae) patchKeys(fields.ae);
-    if (toggles.ke && fields.ke) patchKeys(fields.ke);
-    return patched;
-  }
-
-  // Otherwise fallback: only patch the generic formula if at least one toggle is enabled.
-  if ((toggles.lp || toggles.ae || toggles.ke) && fields.any && fields.any.length) {
-    patchKeys(fields.any);
-  }
-
-  return patched;
+  return { modInput, lpInput, aeInput };
 }
 
-Hooks.on("renderDialog", (app, html) => {
-  try {
-    // Must have actor in options (DSA5 passes it for regen)
-    const actor = app?.options?.actor;
-    if (!actor) return;
+function ensureMasterfulUI(app, root) {
+  const dialogId = app.id;
+  const state = getState(dialogId);
 
-    // Must be regen dialog (class-based + safe fallbacks)
-    if (!isRegenerationDialog(app, html)) return;
+  // Insert once
+  if (root.querySelector(".masterful-regeneration-panel")) return;
 
-    // Must have Masterful Regeneration on actor
-    if (!hasMasterful(actor)) return;
+  const panel = document.createElement("section");
+  panel.className = "masterful-regeneration-panel";
+  panel.style.marginTop = "8px";
+  panel.style.paddingTop = "6px";
+  panel.style.borderTop = "1px solid rgba(0,0,0,0.15)";
 
-    const form = html.find("form");
-    if (!form.length) return;
+  // Row container
+  const row = document.createElement("div");
+  row.style.display = "flex";
+  row.style.gap = "14px";
+  row.style.alignItems = "center";
+  row.style.flexWrap = "wrap";
 
-    // Avoid double-inject
-    if (form.find(`.${MOD.ui.css}`).length) return;
+  const title = document.createElement("div");
+  title.textContent = "Masterful:";
+  title.style.fontSize = "12px";
+  title.style.opacity = "0.85";
+  title.style.marginRight = "4px";
 
-    // Add UI block (defaults ON)
-    const block = $(`
-      <fieldset class="${MOD.ui.css}" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(0,0,0,.15);">
-        <legend style="font-weight:600; padding:0 6px;">${MOD.ui.label}</legend>
-        <div class="form-group" style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-          <label style="display:flex; gap:6px; align-items:center; margin:0;">
-            <input type="checkbox" name="${MOD.ui.id}-lp" checked />
-            ${MOD.ui.lp}
-          </label>
-          <label style="display:flex; gap:6px; align-items:center; margin:0;">
-            <input type="checkbox" name="${MOD.ui.id}-ae" checked />
-            ${MOD.ui.ae}
-          </label>
-          <label style="display:flex; gap:6px; align-items:center; margin:0;">
-            <input type="checkbox" name="${MOD.ui.id}-ke" checked />
-            ${MOD.ui.ke}
-          </label>
-        </div>
-      </fieldset>
-    `);
+  row.appendChild(title);
 
-    // Append near the end of form (won’t break layout)
-    form.append(block);
+  function mkToggle(key, label) {
+    const wrap = document.createElement("label");
+    wrap.style.display = "inline-flex";
+    wrap.style.gap = "6px";
+    wrap.style.alignItems = "center";
+    wrap.style.fontSize = "12px";
+    wrap.style.userSelect = "none";
 
-    // Intercept Roll button (DSA5 uses a named roll button in this dialog)
-    // Be careful not to break other click handlers.
-    const rollBtn = html.find('button[name="roll"], button:contains("Roll")').first();
-    if (!rollBtn.length) return;
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!state[key];
+    cb.dataset.masterfulToggle = key;
 
-    rollBtn.off(`click.${MOD.ui.id}`).on(`click.${MOD.ui.id}`, () => {
-      const toggles = {
-        lp: form.find(`input[name="${MOD.ui.id}-lp"]`).is(":checked"),
-        ae: form.find(`input[name="${MOD.ui.id}-ae"]`).is(":checked"),
-        ke: form.find(`input[name="${MOD.ui.id}-ke"]`).is(":checked")
-      };
-
-      // Patch formulas right before the system does its roll computation
-      const patched = applyMasterfulToFormulas(app.object, toggles);
-
-      // Optional: console trace for debugging
-      // console.log("[Masterful Regen] toggles", toggles, "patched fields", patched);
+    cb.addEventListener("change", () => {
+      state[key] = cb.checked;
     });
 
-  } catch (e) {
-    console.error("[DSA5 Masterful Regeneration Toggle] error", e);
-  }
-});
+    const span = document.createElement("span");
+    span.textContent = label;
 
-// ===== MASTERFUL: hook DSA5Dialog (Foundry v13) =====
+    wrap.appendChild(cb);
+    wrap.appendChild(span);
+    return wrap;
+  }
+
+  row.appendChild(mkToggle("lp", "LP"));
+  row.appendChild(mkToggle("ae", "AE"));
+  row.appendChild(mkToggle("ke", "KE"));
+
+  const hint = document.createElement("div");
+  hint.className = "masterful-marker";
+  hint.textContent = "hook OK";
+  hint.style.fontSize = "12px";
+  hint.style.opacity = "0.65";
+  hint.style.marginLeft = "6px";
+
+  row.appendChild(hint);
+
+  panel.appendChild(row);
+
+  // Place panel near the bottom but above buttons if possible
+  const buttons = root.querySelector(".dialog-buttons") ?? root.querySelector("footer") ?? null;
+  if (buttons?.parentElement) {
+    buttons.parentElement.insertBefore(panel, buttons);
+  } else {
+    root.appendChild(panel);
+  }
+}
+
+// Find the Roll button robustly
+function findRollButton(root) {
+  return (
+    root.querySelector('button[name="roll"]') ||
+    [...root.querySelectorAll("button")].find(b => (b.textContent ?? "").trim().toLowerCase() === "roll") ||
+    null
+  );
+}
+
+// We hook once per dialog render, but ensure we only add one click-capture handler per dialog DOM.
+function ensureRollInterception(app, root) {
+  const rollBtn = findRollButton(root);
+  if (!rollBtn) {
+    console.warn("MASTERFUL | Roll button not found in regen dialog.");
+    return;
+  }
+
+  if (rollBtn.dataset.masterfulHooked === "1") return;
+  rollBtn.dataset.masterfulHooked = "1";
+
+  // Capture phase to run BEFORE system click handlers
+  rollBtn.addEventListener(
+    "click",
+    () => {
+      const state = getState(app.id);
+      const { lpInput, aeInput } = findHeaderInputs(root);
+
+      // If a toggle is OFF, we exclude that resource by forcing formula/value to "0".
+      // If a toggle is ON, we force "1d6" -> "4" if present.
+      //
+      // This is intentionally simple and stable: it edits the form fields before DSA reads them.
+      if (lpInput) {
+        if (state.lp) lpInput.value = replace1d6With4(String(lpInput.value ?? ""));
+        else lpInput.value = "0";
+      }
+
+      if (aeInput) {
+        if (state.ae) aeInput.value = replace1d6With4(String(aeInput.value ?? ""));
+        else aeInput.value = "0";
+      }
+
+      // KE:
+      // В твоём текущем диалоге KE-поля нет (по скрину). Поэтому:
+      // - мы показываем toggle KE
+      // - но подменить формулу можем только если найдём поле KE в будущем/у гевайтов
+      //
+      // Когда KE поле появится, мы расширим findHeaderInputs или найдём по name.
+      if (state.ke) {
+        console.log("MASTERFUL | KE toggle ON (no KE input detected in this dialog layout).");
+      }
+    },
+    { capture: true }
+  );
+}
+
+// Main hook
 Hooks.on("renderDSA5Dialog", (app, html) => {
   try {
-    // У тебя заголовок окна на английском: "Regeneration check"
-    // Если локализация поменяется — просто добавим доп. условия позже.
-    if (app?.title !== "Regeneration check") return;
+    if (!isRegenDialog(app)) return;
 
-    console.log("MASTERFUL | renderDSA5Dialog HIT:", app.id, app.title, app);
-
-    // Вставим явный маркер внизу диалога (чтобы увидеть глазами)
     const root = html?.[0] ?? html;
     if (!root?.querySelector) return;
 
-    // Не вставлять повторно при повторных рендерах
-    if (root.querySelector(".masterful-marker")) return;
+    console.log("MASTERFUL | Regen dialog render:", app.id, app.title);
 
-    const marker = document.createElement("div");
-    marker.className = "masterful-marker";
-    marker.style.marginTop = "8px";
-    marker.style.fontSize = "12px";
-    marker.style.opacity = "0.85";
-    marker.textContent = "Masterful Regeneration: hook OK";
-
-    root.appendChild(marker);
+    ensureMasterfulUI(app, root);
+    ensureRollInterception(app, root);
   } catch (e) {
     console.error("MASTERFUL | renderDSA5Dialog error", e);
   }
