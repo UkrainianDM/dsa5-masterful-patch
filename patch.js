@@ -190,30 +190,31 @@ Hooks.on("renderDialog", (app, html) => {
   }
 });
 
-// ===== MASTERFUL DEBUG: detect DSA5 regeneration dialog by template =====
-const REGEN_TEMPLATE = "systems/dsa5/templates/dialog/regeneration-dialog.hbs";
+// ===== MASTERFUL: hook DSA5Dialog (Foundry v13) =====
+Hooks.on("renderDSA5Dialog", (app, html) => {
+  try {
+    // У тебя заголовок окна на английском: "Regeneration check"
+    // Если локализация поменяется — просто добавим доп. условия позже.
+    if (app?.title !== "Regeneration check") return;
 
-function isRegenApp(app) {
-  const tpl = app?.options?.template ?? app?._options?.template ?? "";
-  return tpl === REGEN_TEMPLATE;
-}
+    console.log("MASTERFUL | renderDSA5Dialog HIT:", app.id, app.title, app);
 
-Hooks.on("renderApplication", (app, html) => {
-  if (!isRegenApp(app)) return;
+    // Вставим явный маркер внизу диалога (чтобы увидеть глазами)
+    const root = html?.[0] ?? html;
+    if (!root?.querySelector) return;
 
-  console.log("MASTERFUL | Regen renderApplication hit:", app.constructor?.name, app);
+    // Не вставлять повторно при повторных рендерах
+    if (root.querySelector(".masterful-marker")) return;
 
-  const root = html?.[0] ?? html;
-  const title = root?.querySelector?.(".window-title");
-  if (title) title.textContent = `${title.textContent} (masterful hook OK)`;
-});
+    const marker = document.createElement("div");
+    marker.className = "masterful-marker";
+    marker.style.marginTop = "8px";
+    marker.style.fontSize = "12px";
+    marker.style.opacity = "0.85";
+    marker.textContent = "Masterful Regeneration: hook OK";
 
-Hooks.on("renderApplicationV2", (app, html) => {
-  if (!isRegenApp(app)) return;
-
-  console.log("MASTERFUL | Regen renderApplicationV2 hit:", app.constructor?.name, app);
-
-  const root = html?.[0] ?? html;
-  const title = root?.querySelector?.(".window-title");
-  if (title) title.textContent = `${title.textContent} (masterful hook OK)`;
+    root.appendChild(marker);
+  } catch (e) {
+    console.error("MASTERFUL | renderDSA5Dialog error", e);
+  }
 });
