@@ -1,0 +1,15 @@
+{
+  "id": "dsa5-masterful-regeneration",
+  "name": "dsa5-masterful-regeneration",
+  "title": "DSA5 Masterful Regeneration Toggle",
+  "description": "Adds Masterful Regeneration toggles (LP/AE/KE) to the DSA5 Regeneration dialog; defaults ON; Foundry v13 + DSA5 7.4.x.",
+  "version": "1.1.0",
+  "authors": [{ "name": "UkrainianDM" }],
+  "minimumCoreVersion": "13",
+  "compatibleCoreVersion": "13",
+  "systems": ["dsa5"],
+  "scripts": ["patch.js"],
+  "url": "https://github.com/UkrainianDM/dsa5-masterful-regeneration",
+  "manifest": "https://raw.githubusercontent.com/UkrainianDM/dsa5-masterful-regeneration/main/module.json",
+  "download": "https://github.com/UkrainianDM/dsa5-masterful-regeneration/releases/download/v1.1.0/dsa5-masterful-regeneration.zip"
+}
