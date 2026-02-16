@@ -8,15 +8,14 @@
 // - No system file modifications
 //
 // Notes:
-// - In DSA5 7.4.x the regeneration UI is rendered via DSA5Dialog, and the dialog instance
-//   does NOT expose template in options. So we detect by title/signatures.
-// - Do NOT let exceptions escape handlers: on Forge this may trigger a hard reload.
+// - Regen UI is rendered via DSA5Dialog; template is not exposed in options.
+// - Never let exceptions escape handlers (Forge may hard reload).
 
 console.log("DSA5 Masterful Regen | patch.js loaded");
 
 const MASTERFUL = {
   state: new Map(), // dialogId -> { lp, ae, ke }
-  wrappedSubmit: false,
+  _rollContext: { active: false, state: null },
 };
 
 function getState(dialogId) {
@@ -43,7 +42,6 @@ function isRegenDialog(app, root) {
 
     if (!root?.querySelector) return false;
 
-    // Signatures: select fields + Roll button text
     const hasSelect = !!root.querySelector("select");
     const hasRoll =
       !!root.querySelector('button[name="roll"]') ||
@@ -51,7 +49,6 @@ function isRegenDialog(app, root) {
         (b) => (b.textContent ?? "").trim().toLowerCase() === "roll"
       );
 
-    // Also includes common labels in this dialog
     const txt = (root.textContent ?? "").toLowerCase();
     const hasCampsiteWord = txt.includes("campsite") || txt.includes("camp");
 
@@ -61,6 +58,40 @@ function isRegenDialog(app, root) {
   }
 }
 
+// ===== Wrap Roll.evaluate once (context-gated) =====
+(function wrapRollEvaluateOnce() {
+  if (globalThis.__masterfulRollWrapped) return;
+  globalThis.__masterfulRollWrapped = true;
+
+  const orig = Roll.prototype.evaluate;
+
+  Roll.prototype.evaluate = function (...args) {
+    try {
+      const ctx = MASTERFUL._rollContext;
+      const st = ctx?.state;
+
+      // активны только во время submit regen-диалога
+      if (!ctx?.active || !st) return orig.apply(this, args);
+
+      // Если все выключены — ничего не трогаем
+      if (!st.lp && !st.ae && !st.ke) return orig.apply(this, args);
+
+      if (typeof this.formula === "string" && this.formula.includes("1d6")) {
+        // Мы не различаем LP/AE на уровне Roll (DSA5 обычно делает отдельные роллы),
+        // поэтому фиксируем любой regen-roll в этом контексте.
+        this._formula = this.formula.replace(/\b1d6\b/g, "4");
+      }
+    } catch (e) {
+      console.error("MASTERFUL | Roll.evaluate wrapper error (ignored)", e);
+    }
+
+    return orig.apply(this, args);
+  };
+
+  console.log("MASTERFUL | Roll.evaluate wrapped safely");
+})();
+
+// ===== UI injection =====
 function ensureMasterfulUI(app, root) {
   const state = getState(app.id);
 
@@ -124,7 +155,6 @@ function ensureMasterfulUI(app, root) {
 
   panel.appendChild(row);
 
-  // Insert panel above dialog buttons if possible
   const buttons =
     root.querySelector(".dialog-buttons") ||
     root.querySelector("footer") ||
@@ -134,8 +164,10 @@ function ensureMasterfulUI(app, root) {
   else root.appendChild(panel);
 }
 
+// ===== Submit wrapper =====
 function wrapSubmitOnce(proto) {
   if (!proto || proto.__masterfulWrapped) return;
+
   const original = proto._onSubmit;
   if (typeof original !== "function") {
     proto.__masterfulWrapped = true;
@@ -146,22 +178,25 @@ function wrapSubmitOnce(proto) {
   proto.__masterfulWrapped = true;
 
   proto._onSubmit = async function (...args) {
+    let state = null;
+    let isRegen = false;
+
     try {
-      // Try to locate current dialog root
       const el = safeRoot(this?.element);
       const root = el?.querySelector ? el : null;
 
       if (root && isRegenDialog(this, root)) {
-        const state = getState(this.id);
+        isRegen = true;
+        state = getState(this.id);
 
         const form = root.querySelector("form");
         if (form) {
-          // Preferred: patch named fields
+          // named fields if present
           const lp = form.querySelector('[name="lp"]');
           const ae = form.querySelector('[name="ae"]');
           const ke = form.querySelector('[name="ke"]');
 
-          // Fallback: patch by position (modifier, LP, AE)
+          // fallback by position (modifier, LP, AE)
           const inputs = [...form.querySelectorAll('input[type="text"], input[type="number"]')];
           const lpFallback = inputs[1] ?? null;
           const aeFallback = inputs[2] ?? null;
@@ -183,11 +218,24 @@ function wrapSubmitOnce(proto) {
         }
       }
     } catch (e) {
-      // Critical: never allow exceptions to escape
       console.error("MASTERFUL | submit wrapper error (ignored)", e);
+      // даже если тут упало — не включаем контекст и просто отдаём оригиналу
     }
 
-    return original.apply(this, args);
+    // Включаем roll-контекст ТОЛЬКО для regen submit и только если state определён
+    if (isRegen && state) {
+      MASTERFUL._rollContext.active = true;
+      MASTERFUL._rollContext.state = state;
+    }
+
+    try {
+      return await original.apply(this, args);
+    } finally {
+      if (isRegen && state) {
+        MASTERFUL._rollContext.active = false;
+        MASTERFUL._rollContext.state = null;
+      }
+    }
   };
 
   console.log("MASTERFUL | _onSubmit wrapped safely");
@@ -199,7 +247,6 @@ Hooks.on("renderDSA5Dialog", (app, html) => {
     const root = safeRoot(html);
     if (!root?.querySelector) return;
 
-    // Install submit wrapper once we see the class
     wrapSubmitOnce(app?.constructor?.prototype);
 
     if (!isRegenDialog(app, root)) return;
