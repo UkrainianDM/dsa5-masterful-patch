@@ -1,16 +1,17 @@
 /**
- * Masterful Regeneration Module — v1.1.x (UI OK + deterministic regen FIXED)
+ * Masterful Regeneration Module — v1.1.x (LP/AE/KP safe toggles + deterministic regen hard-force)
  * Foundry VTT v13 / DSA5 7.4.6 / Forge
  *
- * Why previous "Die.evaluate" forcing did not change outcomes:
- * In Foundry v13 dice are commonly produced via DiceTerm._roll() / DiceTerm.roll(),
- * so overriding Die.evaluate can still allow RNG in the internal fulfillment path.
- *
- * This build forces deterministic regen by overriding DiceTerm._roll (and roll/evaluateSync diagnostics),
- * for ANY d6 term encountered during regen-submit context:
- *   LP -> AE -> KE (by encounter order) => 4 if enabled else 0
- *
- * UI panel is injected reliably for HTMLElement or jQuery html.
+ * Fixes:
+ * 1) AE and KP toggles no longer close the dialog when actor has no AE/KP:
+ *    - Detects whether AE and KP/KE are present in the regen dialog DOM.
+ *    - If absent: corresponding toggle is shown as disabled and click is ignored.
+ *    - All toggles stop event propagation in capture phase to avoid form submit/close.
+ * 2) Deterministic regen:
+ *    - Forces d6 outcomes in regen-submit context by patching multiple dice RNG entry points:
+ *        DiceTerm._roll / DiceTerm.roll
+ *        Die._roll / Die.roll
+ *    - Any d6 encountered during regen context is forced by encounter order: LP -> AE -> KP -> extras.
  */
 (() => {
   const LOG_PREFIX = "MASTERFUL |";
@@ -18,7 +19,7 @@
   MASTERFUL.state = MASTERFUL.state ?? { lp: true, ae: true, ke: true };
   MASTERFUL._rollContext = MASTERFUL._rollContext ?? { active: false, state: { ...MASTERFUL.state }, dieIndex: 0 };
   MASTERFUL._wrapped = MASTERFUL._wrapped ?? {};
-  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 120, traceCountThisSubmit: 0 };
+  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 160, traceCountThisSubmit: 0 };
 
   const RES_ORDER = ["lp", "ae", "ke"];
 
@@ -30,7 +31,7 @@
 
   const diagEnabled = () => !!MASTERFUL._diag?.enabled;
   const inRegenContext = () => !!MASTERFUL._rollContext?.active;
-  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 120);
+  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 160);
   const bumpTrace = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = (MASTERFUL._diag.traceCountThisSubmit ?? 0) + 1; };
   const resetTraceBudget = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = 0; MASTERFUL._rollContext.dieIndex = 0; };
 
@@ -72,6 +73,60 @@
     }
   }
 
+  /**
+   * Detect whether AE exists in this regen dialog (best-effort).
+   */
+  function dialogHasAE(root) {
+    try {
+      if (!root) return false;
+      const text = (root.textContent ?? "").toLowerCase();
+      // Common labels: AE, AsP, Astral, Astralenergie
+      const textHit =
+        /\bae\b/.test(text) ||
+        text.includes("asp") ||
+        text.includes("astral") ||
+        text.includes("astralenergie");
+
+      const selectors = [
+        'input[name*="ae" i]', 'input[name*="asp" i]', 'input[name*="astral" i]',
+        'select[name*="ae" i]', 'select[name*="asp" i]', 'select[name*="astral" i]',
+        '[id*="ae" i]', '[id*="asp" i]', '[id*="astral" i]',
+        '[class*="ae" i]', '[class*="asp" i]', '[class*="astral" i]',
+      ];
+      const domHit = selectors.some(sel => qsa(root, sel).length > 0);
+      return textHit || domHit;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Detect whether KP/KE exists in this regen dialog (best-effort).
+   */
+  function dialogHasKE(root) {
+    try {
+      if (!root) return false;
+      const text = (root.textContent ?? "").toLowerCase();
+      // Common labels: KaP, KP, Karma, KE
+      const textHit =
+        text.includes("kap") ||
+        text.includes("karma") ||
+        /\bkp\b/.test(text) ||
+        /\bke\b/.test(text);
+
+      const selectors = [
+        'input[name*="ke" i]', 'input[name*="kp" i]', 'input[name*="kap" i]', 'input[name*="karma" i]',
+        'select[name*="ke" i]', 'select[name*="kp" i]', 'select[name*="kap" i]', 'select[name*="karma" i]',
+        '[id*="ke" i]', '[id*="kp" i]', '[id*="kap" i]', '[id*="karma" i]',
+        '[class*="ke" i]', '[class*="kp" i]', '[class*="kap" i]', '[class*="karma" i]',
+      ];
+      const domHit = selectors.some(sel => qsa(root, sel).length > 0);
+      return textHit || domHit;
+    } catch {
+      return false;
+    }
+  }
+
   function ensurePanel(html) {
     try {
       const root = toRootElement(html);
@@ -80,6 +135,9 @@
         return;
       }
       if (root.querySelector?.(".masterful-reg-panel")) return;
+
+      const hasAE = dialogHasAE(root);
+      const hasKE = dialogHasKE(root);
 
       const wrap = document.createElement("div");
       wrap.className = "masterful-reg-panel";
@@ -96,7 +154,15 @@
       label.style.opacity = "0.85";
       wrap.appendChild(label);
 
-      const makeToggle = (key, text) => {
+      const paintBtn = (btn, enabled, disabled = false) => {
+        btn.style.background = disabled
+          ? "rgba(120,120,120,0.12)"
+          : (enabled ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)");
+        btn.style.opacity = disabled ? "0.55" : "1";
+        btn.style.cursor = disabled ? "not-allowed" : "pointer";
+      };
+
+      const makeToggle = (key, text, disabled = false) => {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "masterful-toggle";
@@ -105,28 +171,41 @@
         btn.style.padding = "2px 10px";
         btn.style.borderRadius = "6px";
         btn.style.border = "1px solid rgba(255,255,255,0.22)";
-        btn.style.cursor = "pointer";
 
-        const paint = () => {
-          btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
-        };
-        paint();
+        paintBtn(btn, MASTERFUL.state[key], disabled);
 
-        btn.addEventListener("click", () => {
+        btn.addEventListener("click", (ev) => {
+          // Prevent the dialog/form from interpreting the click as submit/close.
+          try {
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+          } catch {}
+
+          if (disabled) {
+            if (diagEnabled()) warn("toggle ignored (disabled)", key);
+            return;
+          }
+
           MASTERFUL.state[key] = !MASTERFUL.state[key];
           MASTERFUL._rollContext.state = { ...MASTERFUL.state };
-          paint();
+          paintBtn(btn, MASTERFUL.state[key], false);
           if (diagEnabled()) log("toggle", key, "=>", MASTERFUL.state[key]);
-        });
+        }, true); // capture
+
         return btn;
       };
 
-      wrap.appendChild(makeToggle("lp", "LP"));
-      wrap.appendChild(makeToggle("ae", "AE"));
-      wrap.appendChild(makeToggle("ke", "KE"));
+      wrap.appendChild(makeToggle("lp", "LP", false));
+      wrap.appendChild(makeToggle("ae", "AE", !hasAE));
+      // Display as KP but keep internal key 'ke'
+      wrap.appendChild(makeToggle("ke", "KP", !hasKE));
 
       const ok = document.createElement("span");
-      ok.textContent = "hook OK";
+      const notes = [];
+      if (!hasAE) notes.push("AE отсутствует");
+      if (!hasKE) notes.push("KP отсутствует");
+      ok.textContent = notes.length ? notes.join(" · ") : "hook OK";
       ok.style.opacity = "0.7";
       ok.style.marginLeft = "6px";
       wrap.appendChild(ok);
@@ -134,17 +213,17 @@
       const form = root.querySelector?.("form");
       if (form?.prepend) {
         form.prepend(wrap);
-        if (diagEnabled()) log("UI panel injected into <form>");
+        if (diagEnabled()) log("UI panel injected into <form>", { hasAE, hasKE });
         return;
       }
       const wc = root.querySelector?.(".window-content");
       if (wc?.prepend) {
         wc.prepend(wrap);
-        if (diagEnabled()) log("UI panel injected into .window-content");
+        if (diagEnabled()) log("UI panel injected into .window-content", { hasAE, hasKE });
         return;
       }
-      if (root.prepend) root.prepend(wrap);
-      if (diagEnabled()) log("UI panel injected into root");
+      root.prepend?.(wrap);
+      if (diagEnabled()) log("UI panel injected into root", { hasAE, hasKE });
     } catch (e) {
       warn("ensurePanel failed", e);
     }
@@ -198,146 +277,68 @@
     return { value: enabled ? 4 : 0, key };
   }
 
-  function summarizeTerms(terms) {
-    try {
-      if (!Array.isArray(terms)) return terms;
-      return terms.map(t => {
-        if (!t) return t;
-        const cls = t.constructor?.name;
-        const base = { type: cls };
-        if (cls === "Die" || cls === "DiceTerm") {
-          base.faces = t.faces;
-          base.number = t.number;
-          base.modifiers = t.modifiers;
-        }
-        if ("operator" in t) base.operator = t.operator;
-        if ("value" in t) base.value = t.value;
-        return base;
-      });
-    } catch {
-      return "(terms unavailable)";
-    }
-  }
-
-  function wrapRollDiagnostics() {
-    if (MASTERFUL._wrapped.rollDiag) return;
-    MASTERFUL._wrapped.rollDiag = true;
-
-    try {
-      // Roll.evaluate / evaluateSync diagnostics (helps confirm the roll is regen-roll)
-      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluate === "function" && !MASTERFUL._wrapped.Roll_evaluate) {
-        const orig = globalThis.Roll.prototype.evaluate;
-        globalThis.Roll.prototype.evaluate = async function (...args) {
-          try {
-            if (diagEnabled() && inRegenContext() && canTraceMore()) {
-              bumpTrace();
-              log("TRACE Roll.evaluate", {
-                at: nowISO(),
-                formula: this?.formula,
-                _formula: this?._formula,
-                terms: summarizeTerms(this?.terms),
-                options: args?.[0],
-                stack: stackTop(10),
-              });
-            }
-          } catch {}
-          return orig.apply(this, args);
-        };
-        MASTERFUL._wrapped.Roll_evaluate = true;
-      }
-
-      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Roll_evaluateSync) {
-        const orig = globalThis.Roll.prototype.evaluateSync;
-        globalThis.Roll.prototype.evaluateSync = function (...args) {
-          try {
-            if (diagEnabled() && inRegenContext() && canTraceMore()) {
-              bumpTrace();
-              log("TRACE Roll.evaluateSync", {
-                at: nowISO(),
-                formula: this?.formula,
-                _formula: this?._formula,
-                terms: summarizeTerms(this?.terms),
-                options: args?.[0],
-                stack: stackTop(10),
-              });
-            }
-          } catch {}
-          return orig.apply(this, args);
-        };
-        MASTERFUL._wrapped.Roll_evaluateSync = true;
-      }
-    } catch (e) {
-      warn("wrapRollDiagnostics failed", e);
-    }
-  }
-
   function wrapDeterministicD6() {
     if (MASTERFUL._wrapped.detD6) return;
     MASTERFUL._wrapped.detD6 = true;
 
     try {
       const DiceTerm = globalThis.foundry?.dice?.terms?.DiceTerm;
-      if (!DiceTerm?.prototype) {
-        warn("DiceTerm prototype not found; cannot force d6");
-        return;
-      }
+      const Die = globalThis.foundry?.dice?.terms?.Die;
 
-      // The core RNG path: DiceTerm._roll
-      if (typeof DiceTerm.prototype._roll === "function" && !MASTERFUL._wrapped.DiceTerm__roll) {
+      if (!DiceTerm?.prototype) warn("DiceTerm prototype not found");
+      if (!Die?.prototype) warn("Die prototype not found");
+
+      const isD6 = (term) => Number(term?.faces) === 6;
+
+      if (DiceTerm?.prototype && typeof DiceTerm.prototype._roll === "function" && !MASTERFUL._wrapped.DiceTerm__roll) {
         const orig = DiceTerm.prototype._roll;
         DiceTerm.prototype._roll = async function (...args) {
-          const isD6 = this?.faces === 6;
-          if (diagEnabled() && inRegenContext() && canTraceMore()) {
-            bumpTrace();
-            log("TRACE DiceTerm._roll", {
-              at: nowISO(),
-              ctor: this?.constructor?.name,
-              faces: this?.faces,
-              number: this?.number,
-              modifiers: this?.modifiers,
-              stack: stackTop(10),
-            });
-          }
-
-          if (!inRegenContext() || !isD6) return orig.apply(this, args);
-
+          if (diagEnabled() && inRegenContext() && canTraceMore()) { bumpTrace(); log("TRACE DiceTerm._roll", { faces: this?.faces, number: this?.number, stack: stackTop(6) }); }
+          if (!inRegenContext() || !isD6(this)) return orig.apply(this, args);
           const { value, key } = nextFixedValueForD6();
           log("FIX DiceTerm._roll", { resource: key, forced: value });
-          return value; // <-- critical: bypass RNG entirely
+          return value;
         };
         MASTERFUL._wrapped.DiceTerm__roll = true;
-        log("DiceTerm._roll wrapped (fix)");
       }
 
-      // Also guard DiceTerm.roll (some code calls it directly)
-      if (typeof DiceTerm.prototype.roll === "function" && !MASTERFUL._wrapped.DiceTerm_roll) {
+      if (DiceTerm?.prototype && typeof DiceTerm.prototype.roll === "function" && !MASTERFUL._wrapped.DiceTerm_roll) {
         const orig = DiceTerm.prototype.roll;
         DiceTerm.prototype.roll = async function (...args) {
-          const isD6 = this?.faces === 6;
-          if (diagEnabled() && inRegenContext() && canTraceMore()) {
-            bumpTrace();
-            log("TRACE DiceTerm.roll", {
-              at: nowISO(),
-              ctor: this?.constructor?.name,
-              faces: this?.faces,
-              number: this?.number,
-              modifiers: this?.modifiers,
-              options: args?.[0],
-              stack: stackTop(10),
-            });
-          }
-
-          if (!inRegenContext() || !isD6) return orig.apply(this, args);
-
+          if (diagEnabled() && inRegenContext() && canTraceMore()) { bumpTrace(); log("TRACE DiceTerm.roll", { faces: this?.faces, number: this?.number, stack: stackTop(6) }); }
+          if (!inRegenContext() || !isD6(this)) return orig.apply(this, args);
           const { value, key } = nextFixedValueForD6();
           log("FIX DiceTerm.roll", { resource: key, forced: value });
-
-          // Return a DiceTermResult-like object; _evaluate will still manage results array.
           return { result: value, active: true };
         };
         MASTERFUL._wrapped.DiceTerm_roll = true;
-        log("DiceTerm.roll wrapped (fix)");
       }
+
+      if (Die?.prototype && typeof Die.prototype._roll === "function" && !MASTERFUL._wrapped.Die__roll) {
+        const orig = Die.prototype._roll;
+        Die.prototype._roll = async function (...args) {
+          if (diagEnabled() && inRegenContext() && canTraceMore()) { bumpTrace(); log("TRACE Die._roll", { faces: this?.faces, number: this?.number, stack: stackTop(6) }); }
+          if (!inRegenContext() || !isD6(this)) return orig.apply(this, args);
+          const { value, key } = nextFixedValueForD6();
+          log("FIX Die._roll", { resource: key, forced: value });
+          return value;
+        };
+        MASTERFUL._wrapped.Die__roll = true;
+      }
+
+      if (Die?.prototype && typeof Die.prototype.roll === "function" && !MASTERFUL._wrapped.Die_roll) {
+        const orig = Die.prototype.roll;
+        Die.prototype.roll = async function (...args) {
+          if (diagEnabled() && inRegenContext() && canTraceMore()) { bumpTrace(); log("TRACE Die.roll", { faces: this?.faces, number: this?.number, stack: stackTop(6) }); }
+          if (!inRegenContext() || !isD6(this)) return orig.apply(this, args);
+          const { value, key } = nextFixedValueForD6();
+          log("FIX Die.roll", { resource: key, forced: value });
+          return { result: value, active: true };
+        };
+        MASTERFUL._wrapped.Die_roll = true;
+      }
+
+      log("deterministic d6 hooks ready");
     } catch (e) {
       warn("wrapDeterministicD6 failed", e);
     }
@@ -345,7 +346,6 @@
 
   Hooks.once("init", () => {
     if (diagEnabled()) log("init", { at: nowISO() });
-    wrapRollDiagnostics();
     wrapDeterministicD6();
   });
 
@@ -353,10 +353,8 @@
     try {
       if (!looksLikeRegenDialog(app, html)) return;
       if (diagEnabled()) log("regen dialog detected", { at: nowISO(), title: app?.title, template: app?.options?.template });
-
       ensurePanel(html);
       wrapSubmitOnce(app);
-      wrapRollDiagnostics();
       wrapDeterministicD6();
     } catch (e) {
       warn("render hook failed", e);
