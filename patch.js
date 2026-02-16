@@ -189,3 +189,31 @@ Hooks.on("renderDialog", (app, html) => {
     console.error("[DSA5 Masterful Regeneration Toggle] error", e);
   }
 });
+
+// ===== MASTERFUL DEBUG: detect DSA5 regeneration dialog by template =====
+const REGEN_TEMPLATE = "systems/dsa5/templates/dialog/regeneration-dialog.hbs";
+
+function isRegenApp(app) {
+  const tpl = app?.options?.template ?? app?._options?.template ?? "";
+  return tpl === REGEN_TEMPLATE;
+}
+
+Hooks.on("renderApplication", (app, html) => {
+  if (!isRegenApp(app)) return;
+
+  console.log("MASTERFUL | Regen renderApplication hit:", app.constructor?.name, app);
+
+  const root = html?.[0] ?? html;
+  const title = root?.querySelector?.(".window-title");
+  if (title) title.textContent = `${title.textContent} (masterful hook OK)`;
+});
+
+Hooks.on("renderApplicationV2", (app, html) => {
+  if (!isRegenApp(app)) return;
+
+  console.log("MASTERFUL | Regen renderApplicationV2 hit:", app.constructor?.name, app);
+
+  const root = html?.[0] ?? html;
+  const title = root?.querySelector?.(".window-title");
+  if (title) title.textContent = `${title.textContent} (masterful hook OK)`;
+});
