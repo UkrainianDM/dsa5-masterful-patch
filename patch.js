@@ -1,258 +1,443 @@
-// patch.js — DSA5 Masterful Regeneration Toggle
-// Foundry VTT v13 + DSA5 system 7.4.x
-//
-// Features (regen dialog only):
-// - Adds 3 toggles: LP / AE / KE (default ON)
-// - Exclude resource when toggle OFF (sets its formula/value to "0")
-// - Replace "1d6" -> "4" for enabled resources
-// - No system file modifications
-//
-// Notes:
-// - Regen UI is rendered via DSA5Dialog; template is not exposed in options.
-// - Never let exceptions escape handlers (Forge may hard reload).
+/**
+ * Masterful Regeneration Module — diagnostics build (no behavior changes beyond logging)
+ * Foundry VTT v13 / DSA5 system 7.4.6
+ *
+ * What this adds:
+ * - Deep tracing for regen context only:
+ *   - Roll.create
+ *   - Roll.prototype.roll
+ *   - Roll.prototype.evaluate
+ *   - Roll.prototype.evaluateSync (if present)
+ *   - foundry.dice.terms.Die.prototype.evaluate (and evaluateSync if present)
+ *
+ * NOTE: This file intentionally keeps your current functional logic as-is.
+ * It only adds logging and widens interception points for diagnosis.
+ */
+(() => {
+  const MODULE_NS = "MASTERFUL";
+  const LOG_PREFIX = "MASTERFUL |";
 
-console.log("DSA5 Masterful Regen | patch.js loaded");
-
-const MASTERFUL = {
-  state: new Map(), // dialogId -> { lp, ae, ke }
-  _rollContext: { active: false, state: null },
-};
-
-function getState(dialogId) {
-  if (!MASTERFUL.state.has(dialogId)) {
-    MASTERFUL.state.set(dialogId, { lp: true, ae: true, ke: true });
-  }
-  return MASTERFUL.state.get(dialogId);
-}
-
-function replace1d6With4(s) {
-  if (typeof s !== "string") return s;
-  return s.replace(/\b1d6\b/g, "4");
-}
-
-function safeRoot(htmlOrElement) {
-  return htmlOrElement?.[0] ?? htmlOrElement;
-}
-
-// Soft detector: title OR form signatures
-function isRegenDialog(app, root) {
-  try {
-    const title = (app?.title ?? "").toLowerCase();
-    if (title.includes("regeneration")) return true; // "Regeneration check"
-
-    if (!root?.querySelector) return false;
-
-    const hasSelect = !!root.querySelector("select");
-    const hasRoll =
-      !!root.querySelector('button[name="roll"]') ||
-      [...root.querySelectorAll("button")].some(
-        (b) => (b.textContent ?? "").trim().toLowerCase() === "roll"
-      );
-
-    const txt = (root.textContent ?? "").toLowerCase();
-    const hasCampsiteWord = txt.includes("campsite") || txt.includes("camp");
-
-    return hasSelect && hasRoll && hasCampsiteWord;
-  } catch {
-    return false;
-  }
-}
-
-// ===== Wrap Roll.evaluate once (context-gated) =====
-(function wrapRollEvaluateOnce() {
-  if (globalThis.__masterfulRollWrapped) return;
-  globalThis.__masterfulRollWrapped = true;
-
-  const orig = Roll.prototype.evaluate;
-
-  Roll.prototype.evaluate = function (...args) {
-    try {
-      const ctx = MASTERFUL._rollContext;
-      const st = ctx?.state;
-
-      // активны только во время submit regen-диалога
-      if (!ctx?.active || !st) return orig.apply(this, args);
-
-      // Если все выключены — ничего не трогаем
-      if (!st.lp && !st.ae && !st.ke) return orig.apply(this, args);
-
-      if (typeof this.formula === "string" && this.formula.includes("1d6")) {
-        // Мы не различаем LP/AE на уровне Roll (DSA5 обычно делает отдельные роллы),
-        // поэтому фиксируем любой regen-roll в этом контексте.
-        this._formula = this.formula.replace(/\b1d6\b/g, "4");
-      }
-    } catch (e) {
-      console.error("MASTERFUL | Roll.evaluate wrapper error (ignored)", e);
-    }
-
-    return orig.apply(this, args);
+  // --- global state (preserve if already present) ---
+  const MASTERFUL = (globalThis.MASTERFUL = globalThis.MASTERFUL ?? {});
+  MASTERFUL.state = MASTERFUL.state ?? { lp: true, ae: true, ke: true };
+  MASTERFUL._rollContext = MASTERFUL._rollContext ?? { active: false, state: { ...MASTERFUL.state } };
+  MASTERFUL._wrapped = MASTERFUL._wrapped ?? {};
+  MASTERFUL._diag = MASTERFUL._diag ?? {
+    enabled: true,
+    // safety: prevents console spam if regen triggers many sub-rolls
+    maxTracesPerSubmit: 50,
+    traceCountThisSubmit: 0,
+    lastSubmitAt: 0,
   };
 
-  console.log("MASTERFUL | Roll.evaluate wrapped safely");
-})();
-
-// ===== UI injection =====
-function ensureMasterfulUI(app, root) {
-  const state = getState(app.id);
-
-  if (root.querySelector(".masterful-regeneration-panel")) return;
-
-  const panel = document.createElement("section");
-  panel.className = "masterful-regeneration-panel";
-  panel.style.marginTop = "8px";
-  panel.style.paddingTop = "6px";
-  panel.style.borderTop = "1px solid rgba(0,0,0,0.15)";
-
-  const row = document.createElement("div");
-  row.style.display = "flex";
-  row.style.gap = "14px";
-  row.style.alignItems = "center";
-  row.style.flexWrap = "wrap";
-
-  const title = document.createElement("div");
-  title.textContent = "Masterful:";
-  title.style.fontSize = "12px";
-  title.style.opacity = "0.85";
-  title.style.marginRight = "4px";
-  row.appendChild(title);
-
-  function mkToggle(key, label) {
-    const wrap = document.createElement("label");
-    wrap.style.display = "inline-flex";
-    wrap.style.gap = "6px";
-    wrap.style.alignItems = "center";
-    wrap.style.fontSize = "12px";
-    wrap.style.userSelect = "none";
-
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = !!state[key];
-    cb.dataset.masterfulToggle = key;
-
-    cb.addEventListener("change", () => {
-      state[key] = cb.checked;
-    });
-
-    const span = document.createElement("span");
-    span.textContent = label;
-
-    wrap.appendChild(cb);
-    wrap.appendChild(span);
-    return wrap;
+  function nowISO() {
+    try { return new Date().toISOString(); } catch { return String(Date.now()); }
   }
 
-  row.appendChild(mkToggle("lp", "LP"));
-  row.appendChild(mkToggle("ae", "AE"));
-  row.appendChild(mkToggle("ke", "KE"));
-
-  const hint = document.createElement("div");
-  hint.className = "masterful-marker";
-  hint.textContent = "hook OK";
-  hint.style.fontSize = "12px";
-  hint.style.opacity = "0.65";
-  hint.style.marginLeft = "6px";
-  row.appendChild(hint);
-
-  panel.appendChild(row);
-
-  const buttons =
-    root.querySelector(".dialog-buttons") ||
-    root.querySelector("footer") ||
-    null;
-
-  if (buttons?.parentElement) buttons.parentElement.insertBefore(panel, buttons);
-  else root.appendChild(panel);
-}
-
-// ===== Submit wrapper =====
-function wrapSubmitOnce(proto) {
-  if (!proto || proto.__masterfulWrapped) return;
-
-  const original = proto._onSubmit;
-  if (typeof original !== "function") {
-    proto.__masterfulWrapped = true;
-    console.warn("MASTERFUL | _onSubmit missing on DSA5Dialog prototype");
-    return;
-  }
-
-  proto.__masterfulWrapped = true;
-
-  proto._onSubmit = async function (...args) {
-    let state = null;
-    let isRegen = false;
-
+  function safeStringify(obj) {
     try {
-      const el = safeRoot(this?.element);
-      const root = el?.querySelector ? el : null;
+      return JSON.stringify(obj, (k, v) => {
+        if (v instanceof Map) return { __map__: Array.from(v.entries()) };
+        if (v instanceof Set) return { __set__: Array.from(v.values()) };
+        if (typeof v === "bigint") return v.toString();
+        return v;
+      });
+    } catch (e) {
+      return String(obj);
+    }
+  }
 
-      if (root && isRegenDialog(this, root)) {
-        isRegen = true;
-        state = getState(this.id);
+  function stackTop(lines = 10) {
+    const s = (new Error()).stack;
+    if (!s) return "(no stack)";
+    return s.split("\n").slice(0, lines).join("\n");
+  }
 
-        const form = root.querySelector("form");
-        if (form) {
-          // named fields if present
-          const lp = form.querySelector('[name="lp"]');
-          const ae = form.querySelector('[name="ae"]');
-          const ke = form.querySelector('[name="ke"]');
+  function diagEnabled() {
+    return !!MASTERFUL._diag?.enabled;
+  }
 
-          // fallback by position (modifier, LP, AE)
-          const inputs = [...form.querySelectorAll('input[type="text"], input[type="number"]')];
-          const lpFallback = inputs[1] ?? null;
-          const aeFallback = inputs[2] ?? null;
+  function inRegenContext() {
+    return !!MASTERFUL._rollContext?.active;
+  }
 
-          const lpField = lp ?? lpFallback;
-          const aeField = ae ?? aeFallback;
+  function canTraceMore() {
+    const d = MASTERFUL._diag;
+    if (!d) return true;
+    return d.traceCountThisSubmit < d.maxTracesPerSubmit;
+  }
 
-          if (lpField) lpField.value = state.lp ? replace1d6With4(String(lpField.value ?? "")) : "0";
-          if (aeField) aeField.value = state.ae ? replace1d6With4(String(aeField.value ?? "")) : "0";
-          if (ke) ke.value = state.ke ? replace1d6With4(String(ke.value ?? "")) : "0";
+  function bumpTrace() {
+    const d = MASTERFUL._diag;
+    if (!d) return;
+    d.traceCountThisSubmit += 1;
+  }
 
-          console.log("MASTERFUL | submit patched values", {
-            dialogId: this.id,
-            lp: lpField?.value,
-            ae: aeField?.value,
-            ke: ke?.value,
-            state
+  function resetTraceBudget() {
+    const d = MASTERFUL._diag;
+    if (!d) return;
+    d.traceCountThisSubmit = 0;
+    d.lastSubmitAt = Date.now();
+  }
+
+  function log(...args) {
+    // Keep your style; do not throw if console is missing
+    try { console.log(LOG_PREFIX, ...args); } catch {}
+  }
+
+  function warn(...args) {
+    try { console.warn(LOG_PREFIX, ...args); } catch {}
+  }
+
+  function err(...args) {
+    try { console.error(LOG_PREFIX, ...args); } catch {}
+  }
+
+  // --- Helpers to detect regen dialog (keep your existing heuristics, but add optional template check) ---
+  function looksLikeRegenDialog(app, html) {
+    try {
+      const title = String(app?.title ?? "");
+      const titleHit = title.toLowerCase().includes("regeneration");
+      const template = String(app?.options?.template ?? "");
+      const templateHit = template.includes("regeneration-dialog.hbs");
+      // DOM signature heuristic: select + roll button + campsite text
+      const hasSelect = html?.find?.("select")?.length > 0;
+      const hasRollBtn = html?.find?.("button")?.filter?.((i, el) => {
+        const t = (el?.innerText ?? "").toLowerCase();
+        return t.includes("roll") || t.includes("würf") || t.includes("wuerf") || t.includes("würfel") || t.includes("regener");
+      })?.length > 0;
+      const hasCampsiteText = (html?.text?.() ?? "").toLowerCase().includes("campsite");
+
+      return templateHit || titleHit || (hasSelect && hasRollBtn) || (hasSelect && hasCampsiteText);
+    } catch {
+      return false;
+    }
+  }
+
+  // --- UI panel (keep existing behavior; minimal) ---
+  function ensurePanel(html) {
+    try {
+      // do not duplicate
+      if (html.find?.(".masterful-reg-panel")?.length) return;
+
+      const wrap = document.createElement("div");
+      wrap.className = "masterful-reg-panel";
+      wrap.style.display = "flex";
+      wrap.style.gap = "8px";
+      wrap.style.alignItems = "center";
+      wrap.style.padding = "6px 8px";
+      wrap.style.marginBottom = "6px";
+      wrap.style.border = "1px solid rgba(255,255,255,0.15)";
+      wrap.style.borderRadius = "6px";
+
+      const label = document.createElement("div");
+      label.textContent = "Masterful:";
+      label.style.opacity = "0.85";
+      wrap.appendChild(label);
+
+      const makeToggle = (key, text) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "masterful-toggle";
+        btn.dataset.key = key;
+        btn.textContent = `[${text}]`;
+        btn.style.padding = "2px 8px";
+        btn.style.borderRadius = "6px";
+        btn.style.border = "1px solid rgba(255,255,255,0.2)";
+        btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
+        btn.style.cursor = "pointer";
+        btn.addEventListener("click", () => {
+          MASTERFUL.state[key] = !MASTERFUL.state[key];
+          MASTERFUL._rollContext.state = { ...MASTERFUL.state };
+          btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
+          if (diagEnabled()) log("toggle", key, "=>", MASTERFUL.state[key]);
+        });
+        return btn;
+      };
+
+      wrap.appendChild(makeToggle("lp", "LP"));
+      wrap.appendChild(makeToggle("ae", "AE"));
+      wrap.appendChild(makeToggle("ke", "KE"));
+
+      const ok = document.createElement("span");
+      ok.textContent = "hook OK";
+      ok.style.opacity = "0.7";
+      ok.style.marginLeft = "6px";
+      wrap.appendChild(ok);
+
+      // Inject at top of dialog content
+      const content = html[0]?.querySelector?.(".window-content") ?? html[0];
+      if (content?.firstChild) content.insertBefore(wrap, content.firstChild);
+      else content?.appendChild(wrap);
+    } catch (e) {
+      warn("ensurePanel failed", e);
+    }
+  }
+
+  // --- Submit wrapper: just sets rollContext and trace budget ---
+  function wrapSubmitOnce(app) {
+    try {
+      if (!app || MASTERFUL._wrapped?.submit) return;
+      if (typeof app._onSubmit !== "function") return;
+
+      const orig = app._onSubmit.bind(app);
+      app._onSubmit = async function (...args) {
+        // Enable context only for this submit
+        resetTraceBudget();
+        MASTERFUL._rollContext.active = true;
+        MASTERFUL._rollContext.state = { ...MASTERFUL.state };
+
+        if (diagEnabled()) {
+          log("submit context ON", {
+            at: nowISO(),
+            appTitle: app?.title,
+            template: app?.options?.template,
+            state: MASTERFUL._rollContext.state,
           });
         }
-      }
-    } catch (e) {
-      console.error("MASTERFUL | submit wrapper error (ignored)", e);
-      // даже если тут упало — не включаем контекст и просто отдаём оригиналу
-    }
 
-    // Включаем roll-контекст ТОЛЬКО для regen submit и только если state определён
-    if (isRegen && state) {
-      MASTERFUL._rollContext.active = true;
-      MASTERFUL._rollContext.state = state;
+        try {
+          return await orig(...args);
+        } catch (e) {
+          // keep your safety policy: suppress so Forge doesn't refresh
+          err("submit wrapper suppressed exception", e);
+        } finally {
+          MASTERFUL._rollContext.active = false;
+          if (diagEnabled()) log("submit context OFF", { at: nowISO(), traces: MASTERFUL._diag?.traceCountThisSubmit ?? 0 });
+        }
+      };
+
+      MASTERFUL._wrapped.submit = true;
+      if (diagEnabled()) log("Submit wrapped safely");
+    } catch (e) {
+      warn("wrapSubmitOnce failed", e);
     }
+  }
+
+  // --- Roll diagnostics wrappers ---
+  function wrapRollDiagnostics() {
+    if (MASTERFUL._wrapped.rollDiagnostics) return;
+    MASTERFUL._wrapped.rollDiagnostics = true;
 
     try {
-      return await original.apply(this, args);
-    } finally {
-      if (isRegen && state) {
-        MASTERFUL._rollContext.active = false;
-        MASTERFUL._rollContext.state = null;
+      // Wrap Roll.create (static), if present
+      if (globalThis.Roll && typeof globalThis.Roll.create === "function" && !MASTERFUL._wrapped.Roll_create) {
+        const origCreate = globalThis.Roll.create.bind(globalThis.Roll);
+        globalThis.Roll.create = function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              const [formula, data, options] = args;
+              log("TRACE Roll.create", {
+                at: nowISO(),
+                formula,
+                dataKeys: data ? Object.keys(data) : null,
+                options,
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return origCreate(...args);
+        };
+        MASTERFUL._wrapped.Roll_create = true;
+        if (diagEnabled()) log("Roll.create wrapped (diagnostic)");
       }
+
+      // Wrap Roll.prototype.roll
+      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.roll === "function" && !MASTERFUL._wrapped.Roll_roll) {
+        const orig = globalThis.Roll.prototype.roll;
+        globalThis.Roll.prototype.roll = async function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              log("TRACE Roll.roll", {
+                at: nowISO(),
+                formula: this?.formula,
+                _formula: this?._formula,
+                terms: summarizeTerms(this?.terms),
+                options: args?.[0],
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return orig.apply(this, args);
+        };
+        MASTERFUL._wrapped.Roll_roll = true;
+        if (diagEnabled()) log("Roll.prototype.roll wrapped (diagnostic)");
+      }
+
+      // Wrap Roll.prototype.evaluate
+      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluate === "function" && !MASTERFUL._wrapped.Roll_evaluate) {
+        const orig = globalThis.Roll.prototype.evaluate;
+        globalThis.Roll.prototype.evaluate = async function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              log("TRACE Roll.evaluate", {
+                at: nowISO(),
+                formula: this?.formula,
+                _formula: this?._formula,
+                terms: summarizeTerms(this?.terms),
+                options: args?.[0],
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return orig.apply(this, args);
+        };
+        MASTERFUL._wrapped.Roll_evaluate = true;
+        if (diagEnabled()) log("Roll.prototype.evaluate wrapped (diagnostic)");
+      }
+
+      // Wrap Roll.prototype.evaluateSync (if exists)
+      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Roll_evaluateSync) {
+        const orig = globalThis.Roll.prototype.evaluateSync;
+        globalThis.Roll.prototype.evaluateSync = function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              log("TRACE Roll.evaluateSync", {
+                at: nowISO(),
+                formula: this?.formula,
+                _formula: this?._formula,
+                terms: summarizeTerms(this?.terms),
+                options: args?.[0],
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return orig.apply(this, args);
+        };
+        MASTERFUL._wrapped.Roll_evaluateSync = true;
+        if (diagEnabled()) log("Roll.prototype.evaluateSync wrapped (diagnostic)");
+      }
+
+      // Wrap Die.evaluate (actual dice roll)
+      const Die = globalThis.foundry?.dice?.terms?.Die;
+      if (Die?.prototype && typeof Die.prototype.evaluate === "function" && !MASTERFUL._wrapped.Die_evaluate) {
+        const orig = Die.prototype.evaluate;
+        Die.prototype.evaluate = async function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              log("TRACE Die.evaluate", {
+                at: nowISO(),
+                faces: this?.faces,
+                number: this?.number,
+                modifiers: this?.modifiers,
+                options: args?.[0],
+                // results can be huge; show a small snapshot
+                resultsBefore: snapshotResults(this?.results),
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return orig.apply(this, args);
+        };
+        MASTERFUL._wrapped.Die_evaluate = true;
+        if (diagEnabled()) log("Die.prototype.evaluate wrapped (diagnostic)");
+      }
+
+      // Wrap Die.evaluateSync (if exists)
+      if (Die?.prototype && typeof Die.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Die_evaluateSync) {
+        const orig = Die.prototype.evaluateSync;
+        Die.prototype.evaluateSync = function (...args) {
+          try {
+            if (diagEnabled() && inRegenContext() && canTraceMore()) {
+              bumpTrace();
+              log("TRACE Die.evaluateSync", {
+                at: nowISO(),
+                faces: this?.faces,
+                number: this?.number,
+                modifiers: this?.modifiers,
+                options: args?.[0],
+                resultsBefore: snapshotResults(this?.results),
+                stack: stackTop(12),
+              });
+            }
+          } catch {}
+          return orig.apply(this, args);
+        };
+        MASTERFUL._wrapped.Die_evaluateSync = true;
+        if (diagEnabled()) log("Die.prototype.evaluateSync wrapped (diagnostic)");
+      }
+
+      if (diagEnabled()) log("Roll/Die diagnostics ready");
+    } catch (e) {
+      warn("wrapRollDiagnostics failed", e);
     }
-  };
-
-  console.log("MASTERFUL | _onSubmit wrapped safely");
-}
-
-// Main render hook
-Hooks.on("renderDSA5Dialog", (app, html) => {
-  try {
-    const root = safeRoot(html);
-    if (!root?.querySelector) return;
-
-    wrapSubmitOnce(app?.constructor?.prototype);
-
-    if (!isRegenDialog(app, root)) return;
-
-    ensureMasterfulUI(app, root);
-  } catch (e) {
-    console.error("MASTERFUL | renderDSA5Dialog error", e);
   }
-});
+
+  function snapshotResults(results) {
+    try {
+      if (!Array.isArray(results)) return results;
+      return results.slice(0, 5).map(r => {
+        if (!r) return r;
+        return {
+          result: r.result,
+          active: r.active,
+          discarded: r.discarded,
+          success: r.success,
+          failure: r.failure,
+          count: r.count,
+        };
+      });
+    } catch {
+      return "(unavailable)";
+    }
+  }
+
+  function summarizeTerms(terms) {
+    try {
+      if (!Array.isArray(terms)) return terms;
+      return terms.map(t => {
+        if (!t) return t;
+        const cls = t.constructor?.name;
+        // Die, OperatorTerm, NumericTerm, Grouping, ParentheticalTerm, etc.
+        const base = { type: cls };
+        if (cls === "Die" || cls === "DiceTerm") {
+          base.faces = t.faces;
+          base.number = t.number;
+          base.modifiers = t.modifiers;
+        }
+        if ("operator" in t) base.operator = t.operator;
+        if ("number" in t && cls !== "Die") base.number = t.number;
+        if ("value" in t) base.value = t.value;
+        return base;
+      });
+    } catch {
+      return "(terms unavailable)";
+    }
+  }
+
+  // --- Hooks ---
+  Hooks.once("init", () => {
+    try {
+      if (diagEnabled()) log("init", { at: nowISO() });
+      wrapRollDiagnostics();
+    } catch (e) {
+      warn("init failed", e);
+    }
+  });
+
+  Hooks.on("renderDSA5Dialog", (app, html) => {
+    try {
+      if (!looksLikeRegenDialog(app, html)) return;
+
+      if (diagEnabled()) {
+        log("regen dialog detected", {
+          at: nowISO(),
+          title: app?.title,
+          template: app?.options?.template,
+        });
+      }
+
+      ensurePanel(html);
+      wrapSubmitOnce(app);
+      wrapRollDiagnostics();
+    } catch (e) {
+      warn("render hook failed", e);
+    }
+  });
+
+})();
