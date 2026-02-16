@@ -1,20 +1,33 @@
 /**
- * Masterful Regeneration Module — v1.1.x (stable toggles + stable deterministic regen)
+ * Masterful Regeneration Module — v1.1.x (stable UI + deterministic regen via Roll._evaluateTotal)
  * Foundry VTT v13 / DSA5 7.4.6 / Forge
  *
- * Fix 1: Toggle buttons never submit/close dialogs.
- *  - All toggles stop propagation in capture phase.
- *  - AE/KP toggles are disabled if those resources are not present in the dialog.
+ * Key change (approach reset):
+ * - Instead of patching Die/DiceTerm RNG entry points (which may not affect cached Roll totals),
+ *   we patch Roll#_evaluateTotal (exists in Foundry v13) to ensure the cached _total is computed
+ *   from forced deterministic Die.results.
  *
- * Fix 2: Deterministic regeneration without breaking DSA5 expectations.
- *  - We DO NOT replace Die.roll return type anymore (previously caused TypeError in DSA5).
- *  - Instead, we call the original method, then overwrite the resulting Die.results with fixed values.
- *  - This preserves Foundry's expected return values and DSA5's consumption of results.
+ * Why this works:
+ * - Roll caches its numeric total in _total during evaluation. (Foundry API shows internal _total cache
+ *   and private _evaluateTotal method.)  citeturn1view0
+ * - If we only modify Die.results AFTER the roll, the cached total can remain "random".
+ * - By forcing Die.results BEFORE calling the original _evaluateTotal, we guarantee the cached total
+ *   matches our deterministic dice values.
  *
  * Forcing rule (regen-submit context only):
- *   Encountered d6 dice terms: LP -> AE -> KP/KE -> extras
+ *   Each encountered d6 Die term (faces===6) in the Roll is mapped by encounter order:
+ *     1st d6 => LP/LE
+ *     2nd d6 => AE
+ *     3rd d6 => KP/KE
+ *     extras => treated as enabled => 4
+ *   For each resource:
  *     enabled => 4
  *     disabled => 0
+ *
+ * UI:
+ * - Panel injected reliably for HTMLElement or jQuery html.
+ * - AE/KP toggles disabled if corresponding resource isn't present in dialog DOM.
+ * - All toggles stop propagation in capture phase (prevents dialog closing).
  */
 (() => {
   const LOG_PREFIX = "MASTERFUL |";
@@ -22,7 +35,7 @@
   MASTERFUL.state = MASTERFUL.state ?? { lp: true, ae: true, ke: true };
   MASTERFUL._rollContext = MASTERFUL._rollContext ?? { active: false, state: { ...MASTERFUL.state }, dieIndex: 0 };
   MASTERFUL._wrapped = MASTERFUL._wrapped ?? {};
-  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 120, traceCountThisSubmit: 0 };
+  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 80, traceCountThisSubmit: 0 };
 
   const RES_ORDER = ["lp", "ae", "ke"];
 
@@ -30,7 +43,7 @@
   const diagEnabled = () => !!MASTERFUL._diag?.enabled;
   const inRegenContext = () => !!MASTERFUL._rollContext?.active;
   const bumpTrace = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = (MASTERFUL._diag.traceCountThisSubmit ?? 0) + 1; };
-  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 120);
+  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 80);
   const resetTraceBudget = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = 0; MASTERFUL._rollContext.dieIndex = 0; };
 
   const log = (...a) => { try { console.log(LOG_PREFIX, ...a); } catch {} };
@@ -139,7 +152,6 @@
         paint(btn, MASTERFUL.state[key], disabled);
 
         btn.addEventListener("click", (ev) => {
-          // prevent any dialog/form submit/close
           try { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation?.(); } catch {}
           if (disabled) { if (diagEnabled()) warn("toggle ignored (disabled)", key); return; }
           MASTERFUL.state[key] = !MASTERFUL.state[key];
@@ -151,7 +163,7 @@
         return btn;
       };
 
-      wrap.appendChild(makeToggle("lp", "LE", false));          // display LE/LP label per your UI wording need
+      wrap.appendChild(makeToggle("lp", "LE", false));
       wrap.appendChild(makeToggle("ae", "AE", !hasAE));
       wrap.appendChild(makeToggle("ke", "KP", !hasKE));
 
@@ -223,59 +235,66 @@
     } catch {}
   }
 
-  function wrapDeterministicD6Stable() {
-    if (MASTERFUL._wrapped.detD6Stable) return;
-    MASTERFUL._wrapped.detD6Stable = true;
+  function wrapRollEvaluateTotal() {
+    if (MASTERFUL._wrapped.Roll_evaluateTotal) return;
+    const Roll = globalThis.Roll;
+    if (!Roll?.prototype || typeof Roll.prototype._evaluateTotal !== "function") {
+      warn("Roll.prototype._evaluateTotal not found; cannot force totals");
+      return;
+    }
 
-    try {
-      const Die = globalThis.foundry?.dice?.terms?.Die;
-      if (!Die?.prototype || typeof Die.prototype.roll !== "function") {
-        warn("Die.prototype.roll not found; cannot force d6");
-        return;
-      }
-
-      const origRoll = Die.prototype.roll;
-      Die.prototype.roll = async function (...args) {
-        const isD6 = Number(this?.faces) === 6;
-        if (diagEnabled() && inRegenContext() && isD6 && canTraceMore()) { bumpTrace(); log("TRACE Die.roll (pre)", { faces: this?.faces, number: this?.number }); }
-
-        // Always let Foundry do its normal bookkeeping, THEN overwrite results.
-        const ret = await origRoll.apply(this, args);
-
-        if (inRegenContext() && isD6) {
-          const { value, key } = nextFixedValueForD6();
-          forceDieResults(this, value);
-          log("FIX Die.roll (post)", { resource: key, forced: value });
+    const orig = Roll.prototype._evaluateTotal;
+    Roll.prototype._evaluateTotal = function (...args) {
+      try {
+        if (diagEnabled() && inRegenContext() && canTraceMore()) {
+          bumpTrace();
+          log("TRACE Roll._evaluateTotal (pre)", { formula: this?.formula, dieIndex: MASTERFUL._rollContext.dieIndex });
         }
 
-        return ret;
-      };
+        if (inRegenContext()) {
+          // Reset mapping for each roll total computation (regen dialog typically evaluates one roll).
+          // But if DSA5 does multiple totals per submit, we still want deterministic stable mapping
+          // across terms in the same roll. So: only reset if dieIndex==0 already managed per submit.
+          // (No action here.)
 
-      // If sync path exists, patch similarly
-      if (typeof Die.prototype.rollSync === "function" && !MASTERFUL._wrapped.Die_rollSync) {
-        const origRollSync = Die.prototype.rollSync;
-        Die.prototype.rollSync = function (...args) {
-          const isD6 = Number(this?.faces) === 6;
-          const ret = origRollSync.apply(this, args);
-          if (inRegenContext() && isD6) {
+          // Force d6 die terms in THIS roll before total is computed.
+          const DieClass = globalThis.foundry?.dice?.terms?.Die;
+          const terms = Array.isArray(this?.terms) ? this.terms : [];
+          for (const t of terms) {
+            const isDie = DieClass ? (t instanceof DieClass) : (t?.constructor?.name === "Die");
+            if (!isDie) continue;
+            if (Number(t?.faces) !== 6) continue;
             const { value, key } = nextFixedValueForD6();
-            forceDieResults(this, value);
-            log("FIX Die.rollSync (post)", { resource: key, forced: value });
+            forceDieResults(t, value);
+            if (diagEnabled()) log("FIX term before total", { resource: key, forced: value });
           }
-          return ret;
-        };
-        MASTERFUL._wrapped.Die_rollSync = true;
+
+          // Ensure cached total is recomputed from our forced results
+          try { this._total = undefined; } catch {}
+        }
+      } catch (e) {
+        warn("Roll._evaluateTotal wrapper pre failed", e);
       }
 
-      if (diagEnabled()) log("Deterministic d6 patch installed (stable)");
-    } catch (e) {
-      warn("wrapDeterministicD6Stable failed", e);
-    }
+      const total = orig.apply(this, args);
+
+      try {
+        if (diagEnabled() && inRegenContext() && canTraceMore()) {
+          bumpTrace();
+          log("TRACE Roll._evaluateTotal (post)", { total });
+        }
+      } catch {}
+
+      return total;
+    };
+
+    MASTERFUL._wrapped.Roll_evaluateTotal = true;
+    log("Roll._evaluateTotal wrapped (deterministic regen)");
   }
 
   Hooks.once("init", () => {
     if (diagEnabled()) log("init", { at: nowISO() });
-    wrapDeterministicD6Stable();
+    wrapRollEvaluateTotal();
   });
 
   Hooks.on("renderDSA5Dialog", (app, html) => {
@@ -283,7 +302,7 @@
       if (!looksLikeRegenDialog(app, html)) return;
       ensurePanel(html);
       wrapSubmitOnce(app);
-      wrapDeterministicD6Stable();
+      wrapRollEvaluateTotal();
     } catch (e) {
       warn("render hook failed", e);
     }
