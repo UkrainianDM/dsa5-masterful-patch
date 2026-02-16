@@ -1,15 +1,16 @@
 /**
- * Masterful Regeneration Module — v1.1.x (UI fix + deterministic regen)
+ * Masterful Regeneration Module — v1.1.x (UI OK + deterministic regen FIXED)
  * Foundry VTT v13 / DSA5 7.4.6 / Forge
  *
- * Fixes:
- *  - UI panel injection now works whether the hook provides jQuery html or a plain HTMLElement.
- *  - Regen dice forcing is applied to ANY d6 Die term during regen-submit context (number>=1, any modifiers).
- *    Mapping by encountered d6 dice terms order: LP -> AE -> KE -> (extras default enabled=4).
+ * Why previous "Die.evaluate" forcing did not change outcomes:
+ * In Foundry v13 dice are commonly produced via DiceTerm._roll() / DiceTerm.roll(),
+ * so overriding Die.evaluate can still allow RNG in the internal fulfillment path.
  *
- * Diagnostics:
- *  - Traces Roll.create / Roll.roll / Roll.evaluate / Roll.evaluateSync (if present)
- *  - Traces Die.evaluate / Die.evaluateSync (if present) and logs FIX actions
+ * This build forces deterministic regen by overriding DiceTerm._roll (and roll/evaluateSync diagnostics),
+ * for ANY d6 term encountered during regen-submit context:
+ *   LP -> AE -> KE (by encounter order) => 4 if enabled else 0
+ *
+ * UI panel is injected reliably for HTMLElement or jQuery html.
  */
 (() => {
   const LOG_PREFIX = "MASTERFUL |";
@@ -17,7 +18,7 @@
   MASTERFUL.state = MASTERFUL.state ?? { lp: true, ae: true, ke: true };
   MASTERFUL._rollContext = MASTERFUL._rollContext ?? { active: false, state: { ...MASTERFUL.state }, dieIndex: 0 };
   MASTERFUL._wrapped = MASTERFUL._wrapped ?? {};
-  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 80, traceCountThisSubmit: 0 };
+  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 120, traceCountThisSubmit: 0 };
 
   const RES_ORDER = ["lp", "ae", "ke"];
 
@@ -29,7 +30,7 @@
 
   const diagEnabled = () => !!MASTERFUL._diag?.enabled;
   const inRegenContext = () => !!MASTERFUL._rollContext?.active;
-  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 80);
+  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 120);
   const bumpTrace = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = (MASTERFUL._diag.traceCountThisSubmit ?? 0) + 1; };
   const resetTraceBudget = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = 0; MASTERFUL._rollContext.dieIndex = 0; };
 
@@ -38,7 +39,6 @@
   const err = (...a) => { try { console.error(LOG_PREFIX, ...a); } catch {} };
 
   function toRootElement(html) {
-    // Foundry hooks sometimes provide jQuery, sometimes HTMLElement.
     try {
       if (!html) return null;
       if (html instanceof HTMLElement) return html;
@@ -76,7 +76,7 @@
     try {
       const root = toRootElement(html);
       if (!root) {
-        if (diagEnabled()) warn("UI panel: no root element (html not jQuery/HTMLElement?)");
+        if (diagEnabled()) warn("UI panel: no root element (html not HTMLElement/jQuery?)");
         return;
       }
       if (root.querySelector?.(".masterful-reg-panel")) return;
@@ -131,7 +131,6 @@
       ok.style.marginLeft = "6px";
       wrap.appendChild(ok);
 
-      // Prefer inject into the first <form> in the dialog, else into .window-content, else root.
       const form = root.querySelector?.("form");
       if (form?.prepend) {
         form.prepend(wrap);
@@ -199,18 +198,6 @@
     return { value: enabled ? 4 : 0, key };
   }
 
-  function forceDieResults(die, value) {
-    try {
-      const n = Math.max(1, Number(die?.number ?? 1));
-      die.results = Array.from({ length: n }, () => ({ result: value, active: true }));
-      if ("_evaluated" in die) die._evaluated = true;
-      if ("evaluated" in die) die.evaluated = true;
-    } catch (e) {
-      warn("forceDieResults failed", e);
-    }
-    return die;
-  }
-
   function summarizeTerms(terms) {
     try {
       if (!Array.isArray(terms)) return terms;
@@ -232,134 +219,145 @@
     }
   }
 
-  function wrapDiceAndRolls() {
-    if (MASTERFUL._wrapped.diceAndRolls) return;
-    MASTERFUL._wrapped.diceAndRolls = true;
+  function wrapRollDiagnostics() {
+    if (MASTERFUL._wrapped.rollDiag) return;
+    MASTERFUL._wrapped.rollDiag = true;
 
     try {
-      // Roll.create (static), if present
-      if (globalThis.Roll && typeof globalThis.Roll.create === "function" && !MASTERFUL._wrapped.Roll_create) {
-        const origCreate = globalThis.Roll.create.bind(globalThis.Roll);
-        globalThis.Roll.create = function (...args) {
-          try {
-            if (diagEnabled() && inRegenContext() && canTraceMore()) {
-              bumpTrace();
-              const [formula, data, options] = args;
-              log("TRACE Roll.create", { at: nowISO(), formula, dataKeys: data ? Object.keys(data) : null, options, stack: stackTop(10) });
-            }
-          } catch {}
-          return origCreate(...args);
-        };
-        MASTERFUL._wrapped.Roll_create = true;
-        if (diagEnabled()) log("Roll.create wrapped (diagnostic)");
-      }
-
-      // Roll.prototype.roll
-      if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.roll === "function" && !MASTERFUL._wrapped.Roll_roll) {
-        const orig = globalThis.Roll.prototype.roll;
-        globalThis.Roll.prototype.roll = async function (...args) {
-          try {
-            if (diagEnabled() && inRegenContext() && canTraceMore()) {
-              bumpTrace();
-              log("TRACE Roll.roll", { at: nowISO(), formula: this?.formula, _formula: this?._formula, terms: summarizeTerms(this?.terms), options: args?.[0], stack: stackTop(10) });
-            }
-          } catch {}
-          return orig.apply(this, args);
-        };
-        MASTERFUL._wrapped.Roll_roll = true;
-        if (diagEnabled()) log("Roll.prototype.roll wrapped (diagnostic)");
-      }
-
-      // Roll.prototype.evaluate
+      // Roll.evaluate / evaluateSync diagnostics (helps confirm the roll is regen-roll)
       if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluate === "function" && !MASTERFUL._wrapped.Roll_evaluate) {
         const orig = globalThis.Roll.prototype.evaluate;
         globalThis.Roll.prototype.evaluate = async function (...args) {
           try {
             if (diagEnabled() && inRegenContext() && canTraceMore()) {
               bumpTrace();
-              log("TRACE Roll.evaluate", { at: nowISO(), formula: this?.formula, _formula: this?._formula, terms: summarizeTerms(this?.terms), options: args?.[0], stack: stackTop(10) });
+              log("TRACE Roll.evaluate", {
+                at: nowISO(),
+                formula: this?.formula,
+                _formula: this?._formula,
+                terms: summarizeTerms(this?.terms),
+                options: args?.[0],
+                stack: stackTop(10),
+              });
             }
           } catch {}
           return orig.apply(this, args);
         };
         MASTERFUL._wrapped.Roll_evaluate = true;
-        if (diagEnabled()) log("Roll.prototype.evaluate wrapped (diagnostic)");
       }
 
-      // Roll.prototype.evaluateSync (if exists)
       if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Roll_evaluateSync) {
         const orig = globalThis.Roll.prototype.evaluateSync;
         globalThis.Roll.prototype.evaluateSync = function (...args) {
           try {
             if (diagEnabled() && inRegenContext() && canTraceMore()) {
               bumpTrace();
-              log("TRACE Roll.evaluateSync", { at: nowISO(), formula: this?.formula, _formula: this?._formula, terms: summarizeTerms(this?.terms), options: args?.[0], stack: stackTop(10) });
+              log("TRACE Roll.evaluateSync", {
+                at: nowISO(),
+                formula: this?.formula,
+                _formula: this?._formula,
+                terms: summarizeTerms(this?.terms),
+                options: args?.[0],
+                stack: stackTop(10),
+              });
             }
           } catch {}
           return orig.apply(this, args);
         };
         MASTERFUL._wrapped.Roll_evaluateSync = true;
-        if (diagEnabled()) log("Roll.prototype.evaluateSync wrapped (diagnostic)");
       }
-
-      // Die.evaluate / Die.evaluateSync — enforce deterministic results for ANY d6 during regen context
-      const Die = globalThis.foundry?.dice?.terms?.Die;
-      if (Die?.prototype && typeof Die.prototype.evaluate === "function" && !MASTERFUL._wrapped.Die_evaluate) {
-        const orig = Die.prototype.evaluate;
-        Die.prototype.evaluate = async function (...args) {
-          const isD6 = this?.faces === 6;
-          if (diagEnabled() && inRegenContext() && canTraceMore()) {
-            bumpTrace();
-            log("TRACE Die.evaluate", { at: nowISO(), faces: this?.faces, number: this?.number, modifiers: this?.modifiers, options: args?.[0], stack: stackTop(10) });
-          }
-          if (!inRegenContext() || !isD6) return orig.apply(this, args);
-
-          const { value, key } = nextFixedValueForD6();
-          if (diagEnabled()) log("FIX Die.evaluate", { resource: key, forced: value });
-          forceDieResults(this, value);
-          return this; // do not call RNG
-        };
-        MASTERFUL._wrapped.Die_evaluate = true;
-        if (diagEnabled()) log("Die.prototype.evaluate wrapped (diagnostic+fix)");
-      }
-
-      if (Die?.prototype && typeof Die.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Die_evaluateSync) {
-        const orig = Die.prototype.evaluateSync;
-        Die.prototype.evaluateSync = function (...args) {
-          const isD6 = this?.faces === 6;
-          if (diagEnabled() && inRegenContext() && canTraceMore()) {
-            bumpTrace();
-            log("TRACE Die.evaluateSync", { at: nowISO(), faces: this?.faces, number: this?.number, modifiers: this?.modifiers, options: args?.[0], stack: stackTop(10) });
-          }
-          if (!inRegenContext() || !isD6) return orig.apply(this, args);
-
-          const { value, key } = nextFixedValueForD6();
-          if (diagEnabled()) log("FIX Die.evaluateSync", { resource: key, forced: value });
-          forceDieResults(this, value);
-          return this;
-        };
-        MASTERFUL._wrapped.Die_evaluateSync = true;
-        if (diagEnabled()) log("Die.prototype.evaluateSync wrapped (diagnostic+fix)");
-      }
-
-      if (diagEnabled()) log("dice+roll wrappers ready");
     } catch (e) {
-      warn("wrapDiceAndRolls failed", e);
+      warn("wrapRollDiagnostics failed", e);
+    }
+  }
+
+  function wrapDeterministicD6() {
+    if (MASTERFUL._wrapped.detD6) return;
+    MASTERFUL._wrapped.detD6 = true;
+
+    try {
+      const DiceTerm = globalThis.foundry?.dice?.terms?.DiceTerm;
+      if (!DiceTerm?.prototype) {
+        warn("DiceTerm prototype not found; cannot force d6");
+        return;
+      }
+
+      // The core RNG path: DiceTerm._roll
+      if (typeof DiceTerm.prototype._roll === "function" && !MASTERFUL._wrapped.DiceTerm__roll) {
+        const orig = DiceTerm.prototype._roll;
+        DiceTerm.prototype._roll = async function (...args) {
+          const isD6 = this?.faces === 6;
+          if (diagEnabled() && inRegenContext() && canTraceMore()) {
+            bumpTrace();
+            log("TRACE DiceTerm._roll", {
+              at: nowISO(),
+              ctor: this?.constructor?.name,
+              faces: this?.faces,
+              number: this?.number,
+              modifiers: this?.modifiers,
+              stack: stackTop(10),
+            });
+          }
+
+          if (!inRegenContext() || !isD6) return orig.apply(this, args);
+
+          const { value, key } = nextFixedValueForD6();
+          log("FIX DiceTerm._roll", { resource: key, forced: value });
+          return value; // <-- critical: bypass RNG entirely
+        };
+        MASTERFUL._wrapped.DiceTerm__roll = true;
+        log("DiceTerm._roll wrapped (fix)");
+      }
+
+      // Also guard DiceTerm.roll (some code calls it directly)
+      if (typeof DiceTerm.prototype.roll === "function" && !MASTERFUL._wrapped.DiceTerm_roll) {
+        const orig = DiceTerm.prototype.roll;
+        DiceTerm.prototype.roll = async function (...args) {
+          const isD6 = this?.faces === 6;
+          if (diagEnabled() && inRegenContext() && canTraceMore()) {
+            bumpTrace();
+            log("TRACE DiceTerm.roll", {
+              at: nowISO(),
+              ctor: this?.constructor?.name,
+              faces: this?.faces,
+              number: this?.number,
+              modifiers: this?.modifiers,
+              options: args?.[0],
+              stack: stackTop(10),
+            });
+          }
+
+          if (!inRegenContext() || !isD6) return orig.apply(this, args);
+
+          const { value, key } = nextFixedValueForD6();
+          log("FIX DiceTerm.roll", { resource: key, forced: value });
+
+          // Return a DiceTermResult-like object; _evaluate will still manage results array.
+          return { result: value, active: true };
+        };
+        MASTERFUL._wrapped.DiceTerm_roll = true;
+        log("DiceTerm.roll wrapped (fix)");
+      }
+    } catch (e) {
+      warn("wrapDeterministicD6 failed", e);
     }
   }
 
   Hooks.once("init", () => {
     if (diagEnabled()) log("init", { at: nowISO() });
-    wrapDiceAndRolls();
+    wrapRollDiagnostics();
+    wrapDeterministicD6();
   });
 
   Hooks.on("renderDSA5Dialog", (app, html) => {
     try {
       if (!looksLikeRegenDialog(app, html)) return;
       if (diagEnabled()) log("regen dialog detected", { at: nowISO(), title: app?.title, template: app?.options?.template });
+
       ensurePanel(html);
       wrapSubmitOnce(app);
-      wrapDiceAndRolls();
+      wrapRollDiagnostics();
+      wrapDeterministicD6();
     } catch (e) {
       warn("render hook failed", e);
     }
