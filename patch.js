@@ -1,14 +1,15 @@
 /**
- * Masterful Regeneration Module — v1.1.x diagnostic + fixed dice (d6 -> 4) + UI panel restore
- * Foundry VTT v13 / DSA5 system 7.4.6 / Forge
+ * Masterful Regeneration Module — v1.1.x (UI fix + deterministic regen)
+ * Foundry VTT v13 / DSA5 7.4.6 / Forge
  *
- * Changes vs previous diagnostic build:
- *  - UI panel injection made more robust (prepend into <form> or .window-content)
- *  - Regen dice are forced (within regen-submit context):
- *      * enabled resource => each d6 term result becomes 4
- *      * disabled resource => corresponding d6 term result becomes 0
- *    Mapping is by order of encountered d6 dice terms: LP -> AE -> KE.
- *  - Diagnostics preserved: Roll.evaluate/roll/evaluateSync + Die.evaluate/evaluateSync + Roll.create (if used)
+ * Fixes:
+ *  - UI panel injection now works whether the hook provides jQuery html or a plain HTMLElement.
+ *  - Regen dice forcing is applied to ANY d6 Die term during regen-submit context (number>=1, any modifiers).
+ *    Mapping by encountered d6 dice terms order: LP -> AE -> KE -> (extras default enabled=4).
+ *
+ * Diagnostics:
+ *  - Traces Roll.create / Roll.roll / Roll.evaluate / Roll.evaluateSync (if present)
+ *  - Traces Die.evaluate / Die.evaluateSync (if present) and logs FIX actions
  */
 (() => {
   const LOG_PREFIX = "MASTERFUL |";
@@ -16,42 +17,41 @@
   MASTERFUL.state = MASTERFUL.state ?? { lp: true, ae: true, ke: true };
   MASTERFUL._rollContext = MASTERFUL._rollContext ?? { active: false, state: { ...MASTERFUL.state }, dieIndex: 0 };
   MASTERFUL._wrapped = MASTERFUL._wrapped ?? {};
-  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 60, traceCountThisSubmit: 0 };
+  MASTERFUL._diag = MASTERFUL._diag ?? { enabled: true, maxTracesPerSubmit: 80, traceCountThisSubmit: 0 };
 
   const RES_ORDER = ["lp", "ae", "ke"];
 
-  function nowISO() { try { return new Date().toISOString(); } catch { return String(Date.now()); } }
-  function stackTop(lines = 10) { const s = (new Error()).stack; return s ? s.split("\n").slice(0, lines).join("\n") : "(no stack)"; }
-  function diagEnabled() { return !!MASTERFUL._diag?.enabled; }
-  function inRegenContext() { return !!MASTERFUL._rollContext?.active; }
-  function canTraceMore() { return (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 60); }
-  function bumpTrace() { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = (MASTERFUL._diag.traceCountThisSubmit ?? 0) + 1; }
-  function resetTraceBudget() { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = 0; MASTERFUL._rollContext.dieIndex = 0; }
+  const nowISO = () => { try { return new Date().toISOString(); } catch { return String(Date.now()); } };
+  const stackTop = (lines = 10) => {
+    const s = (new Error()).stack;
+    return s ? s.split("\n").slice(0, lines).join("\n") : "(no stack)";
+  };
 
-  function log(...args) { try { console.log(LOG_PREFIX, ...args); } catch {} }
-  function warn(...args) { try { console.warn(LOG_PREFIX, ...args); } catch {} }
-  function err(...args) { try { console.error(LOG_PREFIX, ...args); } catch {} }
+  const diagEnabled = () => !!MASTERFUL._diag?.enabled;
+  const inRegenContext = () => !!MASTERFUL._rollContext?.active;
+  const canTraceMore = () => (MASTERFUL._diag?.traceCountThisSubmit ?? 0) < (MASTERFUL._diag?.maxTracesPerSubmit ?? 80);
+  const bumpTrace = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = (MASTERFUL._diag.traceCountThisSubmit ?? 0) + 1; };
+  const resetTraceBudget = () => { if (MASTERFUL._diag) MASTERFUL._diag.traceCountThisSubmit = 0; MASTERFUL._rollContext.dieIndex = 0; };
 
-  function summarizeTerms(terms) {
+  const log = (...a) => { try { console.log(LOG_PREFIX, ...a); } catch {} };
+  const warn = (...a) => { try { console.warn(LOG_PREFIX, ...a); } catch {} };
+  const err = (...a) => { try { console.error(LOG_PREFIX, ...a); } catch {} };
+
+  function toRootElement(html) {
+    // Foundry hooks sometimes provide jQuery, sometimes HTMLElement.
     try {
-      if (!Array.isArray(terms)) return terms;
-      return terms.map(t => {
-        if (!t) return t;
-        const cls = t.constructor?.name;
-        const base = { type: cls };
-        if (cls === "Die" || cls === "DiceTerm") {
-          base.faces = t.faces;
-          base.number = t.number;
-          base.modifiers = t.modifiers;
-        }
-        if ("operator" in t) base.operator = t.operator;
-        if ("value" in t) base.value = t.value;
-        if ("number" in t && cls !== "Die") base.number = t.number;
-        return base;
-      });
+      if (!html) return null;
+      if (html instanceof HTMLElement) return html;
+      if (Array.isArray(html) && html[0] instanceof HTMLElement) return html[0];
+      if (html[0] instanceof HTMLElement) return html[0]; // jQuery-like
+      return null;
     } catch {
-      return "(terms unavailable)";
+      return null;
     }
+  }
+
+  function qsa(root, sel) {
+    try { return root?.querySelectorAll?.(sel) ?? []; } catch { return []; }
   }
 
   function looksLikeRegenDialog(app, html) {
@@ -60,9 +60,12 @@
       const template = String(app?.options?.template ?? "");
       if (template.includes("regeneration-dialog.hbs")) return true;
       if (title.includes("regeneration")) return true;
-      // fallback DOM heuristics
-      const hasSelect = html?.find?.("select")?.length > 0;
-      const hasCampsiteText = (html?.text?.() ?? "").toLowerCase().includes("campsite");
+
+      const root = toRootElement(html);
+      if (!root) return false;
+      const hasSelect = qsa(root, "select").length > 0;
+      const text = (root.textContent ?? "").toLowerCase();
+      const hasCampsiteText = text.includes("campsite");
       return hasSelect && hasCampsiteText;
     } catch {
       return false;
@@ -71,8 +74,12 @@
 
   function ensurePanel(html) {
     try {
-      if (!html?.find) return;
-      if (html.find(".masterful-reg-panel").length) return;
+      const root = toRootElement(html);
+      if (!root) {
+        if (diagEnabled()) warn("UI panel: no root element (html not jQuery/HTMLElement?)");
+        return;
+      }
+      if (root.querySelector?.(".masterful-reg-panel")) return;
 
       const wrap = document.createElement("div");
       wrap.className = "masterful-reg-panel";
@@ -98,12 +105,17 @@
         btn.style.padding = "2px 10px";
         btn.style.borderRadius = "6px";
         btn.style.border = "1px solid rgba(255,255,255,0.22)";
-        btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
         btn.style.cursor = "pointer";
+
+        const paint = () => {
+          btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
+        };
+        paint();
+
         btn.addEventListener("click", () => {
           MASTERFUL.state[key] = !MASTERFUL.state[key];
           MASTERFUL._rollContext.state = { ...MASTERFUL.state };
-          btn.style.background = MASTERFUL.state[key] ? "rgba(80,160,120,0.25)" : "rgba(160,80,80,0.25)";
+          paint();
           if (diagEnabled()) log("toggle", key, "=>", MASTERFUL.state[key]);
         });
         return btn;
@@ -119,24 +131,20 @@
       ok.style.marginLeft = "6px";
       wrap.appendChild(ok);
 
-      // Robust injection:
-      // 1) into first <form> (best for dialogs)
-      // 2) else into .window-content
-      // 3) else at top of root
-      const $form = html.find("form").first();
-      if ($form?.length) {
-        $form.prepend(wrap);
+      // Prefer inject into the first <form> in the dialog, else into .window-content, else root.
+      const form = root.querySelector?.("form");
+      if (form?.prepend) {
+        form.prepend(wrap);
         if (diagEnabled()) log("UI panel injected into <form>");
         return;
       }
-      const wc = html.find(".window-content").first();
-      if (wc?.length) {
+      const wc = root.querySelector?.(".window-content");
+      if (wc?.prepend) {
         wc.prepend(wrap);
         if (diagEnabled()) log("UI panel injected into .window-content");
         return;
       }
-      const root = html[0];
-      if (root?.prepend) root.prepend(wrap);
+      if (root.prepend) root.prepend(wrap);
       if (diagEnabled()) log("UI panel injected into root");
     } catch (e) {
       warn("ensurePanel failed", e);
@@ -181,36 +189,52 @@
     }
   }
 
-  // Decide fixed value for next encountered d6 term in regen context
   function nextFixedValueForD6() {
     const idx = (MASTERFUL._rollContext.dieIndex ?? 0);
     const key = RES_ORDER[idx] ?? null;
     MASTERFUL._rollContext.dieIndex = idx + 1;
 
-    // If we have more dice than resources, default to enabled behavior (4)
     if (!key) return { value: 4, key: "(extra)" };
-
     const enabled = !!MASTERFUL._rollContext.state?.[key];
     return { value: enabled ? 4 : 0, key };
   }
 
-  function forceDieResult(die, value) {
-    // Die results format: [{result, active, ...}]
+  function forceDieResults(die, value) {
     try {
-      die.results = [{ result: value, active: true }];
-      // Some terms track evaluation state; set if present
+      const n = Math.max(1, Number(die?.number ?? 1));
+      die.results = Array.from({ length: n }, () => ({ result: value, active: true }));
       if ("_evaluated" in die) die._evaluated = true;
       if ("evaluated" in die) die.evaluated = true;
-      return die;
     } catch (e) {
-      warn("forceDieResult failed", e);
-      return die;
+      warn("forceDieResults failed", e);
+    }
+    return die;
+  }
+
+  function summarizeTerms(terms) {
+    try {
+      if (!Array.isArray(terms)) return terms;
+      return terms.map(t => {
+        if (!t) return t;
+        const cls = t.constructor?.name;
+        const base = { type: cls };
+        if (cls === "Die" || cls === "DiceTerm") {
+          base.faces = t.faces;
+          base.number = t.number;
+          base.modifiers = t.modifiers;
+        }
+        if ("operator" in t) base.operator = t.operator;
+        if ("value" in t) base.value = t.value;
+        return base;
+      });
+    } catch {
+      return "(terms unavailable)";
     }
   }
 
-  function wrapRollDiagnosticsAndFix() {
-    if (MASTERFUL._wrapped.rollDiagnostics) return;
-    MASTERFUL._wrapped.rollDiagnostics = true;
+  function wrapDiceAndRolls() {
+    if (MASTERFUL._wrapped.diceAndRolls) return;
+    MASTERFUL._wrapped.diceAndRolls = true;
 
     try {
       // Roll.create (static), if present
@@ -262,7 +286,7 @@
         if (diagEnabled()) log("Roll.prototype.evaluate wrapped (diagnostic)");
       }
 
-      // Roll.prototype.evaluateSync
+      // Roll.prototype.evaluateSync (if exists)
       if (globalThis.Roll?.prototype && typeof globalThis.Roll.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Roll_evaluateSync) {
         const orig = globalThis.Roll.prototype.evaluateSync;
         globalThis.Roll.prototype.evaluateSync = function (...args) {
@@ -278,76 +302,64 @@
         if (diagEnabled()) log("Roll.prototype.evaluateSync wrapped (diagnostic)");
       }
 
-      // Die.evaluate (where dice are actually rolled) — also enforce fixed values in regen context
+      // Die.evaluate / Die.evaluateSync — enforce deterministic results for ANY d6 during regen context
       const Die = globalThis.foundry?.dice?.terms?.Die;
       if (Die?.prototype && typeof Die.prototype.evaluate === "function" && !MASTERFUL._wrapped.Die_evaluate) {
         const orig = Die.prototype.evaluate;
         Die.prototype.evaluate = async function (...args) {
-          const isTarget = inRegenContext() && this?.faces === 6 && this?.number === 1 && Array.isArray(this?.modifiers) && this.modifiers.length === 0;
+          const isD6 = this?.faces === 6;
           if (diagEnabled() && inRegenContext() && canTraceMore()) {
             bumpTrace();
             log("TRACE Die.evaluate", { at: nowISO(), faces: this?.faces, number: this?.number, modifiers: this?.modifiers, options: args?.[0], stack: stackTop(10) });
           }
-
-          if (!isTarget) return orig.apply(this, args);
+          if (!inRegenContext() || !isD6) return orig.apply(this, args);
 
           const { value, key } = nextFixedValueForD6();
           if (diagEnabled()) log("FIX Die.evaluate", { resource: key, forced: value });
-
-          // Do NOT call original RNG — force deterministic
-          forceDieResult(this, value);
-          return this;
+          forceDieResults(this, value);
+          return this; // do not call RNG
         };
         MASTERFUL._wrapped.Die_evaluate = true;
         if (diagEnabled()) log("Die.prototype.evaluate wrapped (diagnostic+fix)");
       }
 
-      // Die.evaluateSync — enforce too
       if (Die?.prototype && typeof Die.prototype.evaluateSync === "function" && !MASTERFUL._wrapped.Die_evaluateSync) {
         const orig = Die.prototype.evaluateSync;
         Die.prototype.evaluateSync = function (...args) {
-          const isTarget = inRegenContext() && this?.faces === 6 && this?.number === 1 && Array.isArray(this?.modifiers) && this.modifiers.length === 0;
+          const isD6 = this?.faces === 6;
           if (diagEnabled() && inRegenContext() && canTraceMore()) {
             bumpTrace();
             log("TRACE Die.evaluateSync", { at: nowISO(), faces: this?.faces, number: this?.number, modifiers: this?.modifiers, options: args?.[0], stack: stackTop(10) });
           }
-
-          if (!isTarget) return orig.apply(this, args);
+          if (!inRegenContext() || !isD6) return orig.apply(this, args);
 
           const { value, key } = nextFixedValueForD6();
           if (diagEnabled()) log("FIX Die.evaluateSync", { resource: key, forced: value });
-
-          forceDieResult(this, value);
+          forceDieResults(this, value);
           return this;
         };
         MASTERFUL._wrapped.Die_evaluateSync = true;
         if (diagEnabled()) log("Die.prototype.evaluateSync wrapped (diagnostic+fix)");
       }
 
-      if (diagEnabled()) log("Roll/Die diagnostics+fix ready");
+      if (diagEnabled()) log("dice+roll wrappers ready");
     } catch (e) {
-      warn("wrapRollDiagnosticsAndFix failed", e);
+      warn("wrapDiceAndRolls failed", e);
     }
   }
 
   Hooks.once("init", () => {
-    try {
-      if (diagEnabled()) log("init", { at: nowISO() });
-      wrapRollDiagnosticsAndFix();
-    } catch (e) {
-      warn("init failed", e);
-    }
+    if (diagEnabled()) log("init", { at: nowISO() });
+    wrapDiceAndRolls();
   });
 
   Hooks.on("renderDSA5Dialog", (app, html) => {
     try {
       if (!looksLikeRegenDialog(app, html)) return;
-
       if (diagEnabled()) log("regen dialog detected", { at: nowISO(), title: app?.title, template: app?.options?.template });
-
       ensurePanel(html);
       wrapSubmitOnce(app);
-      wrapRollDiagnosticsAndFix();
+      wrapDiceAndRolls();
     } catch (e) {
       warn("render hook failed", e);
     }
