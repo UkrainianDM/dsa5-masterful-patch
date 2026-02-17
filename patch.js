@@ -11,8 +11,8 @@
 (() => {
   const LOG = "dsa5-masterful-regeneration |";
 
-  // Per-resource masterful toggle state (persists across dialog re-renders)
-  const toggles = { lp: true, ae: true, kp: true };
+  // Per-resource masterful toggle state (reset per dialog based on actor abilities)
+  const toggles = { lp: false, ae: false, kp: false };
 
   // Roll interception context: queue of booleans [forceLeP?, forceAsP?, forceKaP?]
   const ctx = { active: false, queue: [] };
@@ -54,6 +54,50 @@
 
   function getRoot(html) {
     return html instanceof HTMLElement ? html : html?.[0] ?? null;
+  }
+
+  /* ──────── Actor detection & ability check ──────── */
+
+  function getActorFromDialog(app) {
+    if (app.actor) return app.actor;
+    if (app.options?.actor) return app.options.actor;
+    if (app.data?.actor) return app.data.actor;
+    // Fallback: ChatMessage speaker (usually the actor who opened the dialog)
+    try {
+      const speaker = ChatMessage.getSpeaker();
+      if (speaker?.actor) return game.actors.get(speaker.actor);
+    } catch (_) {}
+    // Fallback: selected token on canvas
+    const token = canvas?.tokens?.controlled?.[0];
+    if (token?.actor) return token.actor;
+    return null;
+  }
+
+  function hasMeisterlicheRegeneration(actor, resource) {
+    if (!actor?.items) return false;
+    return actor.items.some(i =>
+      i.name.includes("Meisterliche Regeneration") && i.name.includes(resource)
+    );
+  }
+
+  /** Reset toggles based on actor's Meisterliche Regeneration abilities. */
+  function updateTogglesFromActor(app, root) {
+    // Only set defaults when the panel is first injected
+    if (root?.querySelector(".masterful-panel")) return;
+
+    toggles.lp = false;
+    toggles.ae = false;
+    toggles.kp = false;
+
+    const actor = getActorFromDialog(app);
+    if (!actor) return;
+
+    toggles.lp = hasMeisterlicheRegeneration(actor, "Lebensenergie");
+    toggles.ae = hasMeisterlicheRegeneration(actor, "Astralenergie");
+    toggles.kp = hasMeisterlicheRegeneration(actor, "Karmaenergie");
+
+    console.log(LOG, "Actor:", actor.name,
+      "| LeP:", toggles.lp, "| AsP:", toggles.ae, "| KaP:", toggles.kp);
   }
 
   /* ──────── UI panel injection ──────── */
@@ -134,6 +178,7 @@
   Hooks.on("renderDSA5Dialog", (app, html) => {
     if (!isRegenDialog(app)) return;
     const root = getRoot(html);
+    updateTogglesFromActor(app, root);
     injectPanel(root);
     hookRollButton(root);
   });
