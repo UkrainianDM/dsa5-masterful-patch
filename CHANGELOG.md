@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.1.2
+
+- Fixed: actor detection now works reliably by scanning open application instances (`foundry.applications.instances`, `ui.windows`) to find the actor sheet that triggered the regeneration dialog
+- Added `app.object` and `app.document` checks for Foundry document-backed apps
+
 ## v2.1.1
 
 - Added bilingual support for ability detection (DE and EN names):

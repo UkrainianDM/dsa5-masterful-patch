@@ -63,6 +63,27 @@
     if (app.actor) return app.actor;
     if (app.options?.actor) return app.options.actor;
     if (app.data?.actor) return app.data.actor;
+    if (app.object instanceof Actor) return app.object;
+    if (app.document instanceof Actor) return app.document;
+
+    // Fallback: find an open actor sheet (the sheet that triggered the dialog)
+    try {
+      const apps = foundry.applications?.instances;
+      if (apps) {
+        for (const w of apps.values()) {
+          if (w.document instanceof Actor) return w.document;
+        }
+      }
+    } catch (_) {}
+
+    // Fallback: legacy UI windows (Foundry v1 apps)
+    try {
+      for (const w of Object.values(ui.windows)) {
+        if (w.actor instanceof Actor) return w.actor;
+        if (w.object instanceof Actor) return w.object;
+        if (w.document instanceof Actor) return w.document;
+      }
+    } catch (_) {}
 
     // Fallback: ChatMessage speaker
     try {
