@@ -59,25 +59,54 @@
   /* ──────── Actor detection & ability check ──────── */
 
   function getActorFromDialog(app) {
+    // Direct references on dialog
     if (app.actor) return app.actor;
     if (app.options?.actor) return app.options.actor;
     if (app.data?.actor) return app.data.actor;
-    // Fallback: ChatMessage speaker (usually the actor who opened the dialog)
+
+    // Fallback: ChatMessage speaker
     try {
       const speaker = ChatMessage.getSpeaker();
-      if (speaker?.actor) return game.actors.get(speaker.actor);
+      if (speaker?.actor) {
+        const a = game.actors.get(speaker.actor);
+        if (a) return a;
+      }
     } catch (_) {}
+
     // Fallback: selected token on canvas
-    const token = canvas?.tokens?.controlled?.[0];
-    if (token?.actor) return token.actor;
+    try {
+      const token = canvas?.tokens?.controlled?.[0];
+      if (token?.actor) return token.actor;
+    } catch (_) {}
+
+    // Fallback: user's default character
+    if (game.user?.character) return game.user.character;
+
     return null;
   }
 
-  function hasMeisterlicheRegeneration(actor, resource) {
-    if (!actor?.items) return false;
-    return actor.items.some(i =>
-      i.name.includes("Meisterliche Regeneration") && i.name.includes(resource)
-    );
+  /**
+   * Scan actor items for regeneration Sonderfertigkeiten and set toggles.
+   *
+   * DE: "Meisterliche Regeneration" / EN: "Masterful Regeneration" → AsP
+   * DE: "Stabile Regeneration"      / EN: "Stable Regeneration"    → KaP
+   */
+  function detectRegenerationAbilities(actor) {
+    if (!actor?.items) return;
+
+    for (const item of actor.items) {
+      const name = item.name ?? "";
+
+      if (name.includes("Meisterliche Regeneration") || name.includes("Masterful Regeneration")) {
+        console.log(LOG, "Found SF:", name, "| type:", item.type);
+        toggles.ae = true;
+      }
+
+      if (name.includes("Stabile Regeneration") || name.includes("Stable Regeneration")) {
+        console.log(LOG, "Found SF:", name, "| type:", item.type);
+        toggles.kp = true;
+      }
+    }
   }
 
   /** Reset toggles based on actor's Meisterliche Regeneration abilities. */
@@ -90,11 +119,12 @@
     toggles.kp = false;
 
     const actor = getActorFromDialog(app);
-    if (!actor) return;
+    if (!actor) {
+      console.warn(LOG, "Could not resolve actor from dialog");
+      return;
+    }
 
-    toggles.lp = hasMeisterlicheRegeneration(actor, "Lebensenergie");
-    toggles.ae = hasMeisterlicheRegeneration(actor, "Astralenergie");
-    toggles.kp = hasMeisterlicheRegeneration(actor, "Karmaenergie");
+    detectRegenerationAbilities(actor);
 
     console.log(LOG, "Actor:", actor.name,
       "| LeP:", toggles.lp, "| AsP:", toggles.ae, "| KaP:", toggles.kp);

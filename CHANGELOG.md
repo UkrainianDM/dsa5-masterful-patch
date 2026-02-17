@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.1.1
+
+- Added bilingual support for ability detection (DE and EN names):
+  - "Meisterliche Regeneration" / "Masterful Regeneration" (magische SF) → enables AsP toggle
+  - "Stabile Regeneration" / "Stable Regeneration" (karmale SF) → enables KaP toggle
+- Improved actor resolution — added `game.user.character` as final fallback
+- Diagnostic logging of matched Sonderfertigkeit items for easier troubleshooting
+
 ## v2.1.0
 
 - Checkboxes for Meisterliche Regeneration are now **off by default**
